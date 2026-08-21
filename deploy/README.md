@@ -47,6 +47,29 @@ Either:
   the compose network. When using this profile, always pass
   `--profile vaultwarden` to compose commands.
 
+### TLS for the bundled vaultwarden
+
+The bw CLI baked into the broker image refuses plain-http vault servers, so
+the compose-internal `http://vaultwarden` does NOT work. Terminate TLS inside
+the vaultwarden container:
+
+```sh
+mkdir -p deploy/vw-tls
+openssl req -x509 -newkey rsa:2048 -nodes -days 825 \
+  -keyout deploy/vw-tls/key.pem -out deploy/vw-tls/cert.pem \
+  -subj "/CN=vaultwarden" \
+  -addext "subjectAltName=DNS:vaultwarden,DNS:localhost,IP:127.0.0.1"
+chmod 644 deploy/vw-tls/key.pem deploy/vw-tls/cert.pem
+```
+
+Then in `docker-compose.yml` uncomment `ROCKET_TLS` and `ROCKET_PORT: "443"`
+and the `./vw-tls:/ssl:ro` mount on the vaultwarden service, and
+`NODE_EXTRA_CA_CERTS: /vw-tls/cert.pem` plus a `./vw-tls:/vw-tls:ro` mount on
+the broker service. The default `VAULT_URL=https://vaultwarden` then resolves
+to port 443 and validates against that cert.
+(Alternatively front vaultwarden with your own TLS proxy and point
+`VAULT_URL` at it.)
+
 Then, in the vault's web UI, with the dedicated automation account:
 
 1. Create the account and store the secrets your agents will need as vault

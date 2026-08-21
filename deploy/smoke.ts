@@ -8,11 +8,12 @@
 // fast path) → assert the child process received the exact secret value →
 // report wall-clock timings. Cleans up the compose project at the end.
 
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createLoginItemWithBw,
+  fetchWithCa,
   obtainUserApiKey,
   registerVaultwardenAccount,
 } from "../server/test/helpers/vaultwarden.ts";
@@ -27,7 +28,9 @@ const COMPOSE = [
   "-f", join(DEPLOY, "docker-compose.smoke.yml"),
 ];
 
-const VW_URL = "http://127.0.0.1:18222";
+const VW_URL = "https://localhost:18222";
+const TLS_DIR = join(DEPLOY, "smoke-tls");
+const CA_FILE = join(TLS_DIR, "cert.pem");
 const BROKER_URL = "http://127.0.0.1:8787";
 const EMAIL = "secretary-smoke@example.com";
 const MASTER_PASSWORD = "smoke-master-password-1";
@@ -63,11 +66,11 @@ async function runOrDie(argv: string[], opts: { env?: Record<string, string> } =
   return result;
 }
 
-async function waitForHttp(url: string, timeoutMs: number) {
+async function waitForHttp(url: string, timeoutMs: number, fetchImpl: typeof fetch = fetch) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(url, { signal: AbortSignal.timeout(2_000) });
+      const response = await fetchImpl(url, { signal: AbortSignal.timeout(2_000) });
       if (response.ok) return;
     } catch {
       // keep waiting
@@ -75,6 +78,21 @@ async function waitForHttp(url: string, timeoutMs: number) {
     await Bun.sleep(500);
   }
   throw new Error(`timed out waiting for ${url}`);
+}
+
+/** Throwaway self-signed cert whose SAN covers the compose-internal name. */
+async function generateSmokeTls() {
+  mkdirSync(TLS_DIR, { recursive: true });
+  const child = Bun.spawn([
+    "/usr/bin/openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+    "-keyout", join(TLS_DIR, "key.pem"), "-out", CA_FILE, "-days", "2",
+    "-subj", "/CN=vaultwarden",
+    "-addext", "subjectAltName=DNS:vaultwarden,DNS:localhost,IP:127.0.0.1",
+  ], { stdin: "ignore", stdout: "ignore", stderr: "pipe" });
+  const [stderr, exitCode] = await Promise.all([new Response(child.stderr).text(), child.exited]);
+  if (exitCode !== 0) throw new Error(`openssl failed: ${stderr}`);
+  // Key must be readable by the vaultwarden container user.
+  await run(["chmod", "644", join(TLS_DIR, "key.pem"), CA_FILE]);
 }
 
 async function main() {
@@ -95,17 +113,20 @@ async function main() {
       BW_EMAIL: EMAIL,
       TELEGRAM_CHAT_ID: "0",
       TELEGRAM_ALLOWED_USER_IDS: "1",
-      VAULT_URL: "http://vaultwarden",
     };
+
+    log("generating throwaway TLS cert (bw refuses plain-http vaults)");
+    await generateSmokeTls();
+    const vwFetch = fetchWithCa(CA_FILE);
 
     log("starting vaultwarden");
     await runOrDie([...COMPOSE, "up", "-d", "vaultwarden"], { env: composeEnv });
     composeUp = true;
-    await waitForHttp(`${VW_URL}/alive`, 60_000);
+    await waitForHttp(`${VW_URL}/alive`, 60_000, vwFetch);
 
     log("bootstrapping vaultwarden account + item");
-    await registerVaultwardenAccount(VW_URL, EMAIL, MASTER_PASSWORD);
-    const apiKey = await obtainUserApiKey(VW_URL, EMAIL, MASTER_PASSWORD);
+    await registerVaultwardenAccount(VW_URL, EMAIL, MASTER_PASSWORD, { fetchImpl: vwFetch });
+    const apiKey = await obtainUserApiKey(VW_URL, EMAIL, MASTER_PASSWORD, { fetchImpl: vwFetch });
     await createLoginItemWithBw({
       bwPath: BW_PATH,
       baseUrl: VW_URL,
@@ -115,13 +136,19 @@ async function main() {
       username: "smoke-user",
       itemPassword: SECRET_VALUE,
       appDataDir: mkdtempSync(join(scratch, "bw-")),
+      tlsCaFile: CA_FILE,
     });
     writeFileSync(join(DEPLOY, "secrets", "bw_clientid"), apiKey.client_id, { mode: 0o600 });
     writeFileSync(join(DEPLOY, "secrets", "bw_clientsecret"), apiKey.client_secret, { mode: 0o600 });
 
     log("building + starting broker");
     await runOrDie([...COMPOSE, "up", "-d", "--build", "broker"], { env: composeEnv });
-    await waitForHttp(`${BROKER_URL}/healthz`, 120_000);
+    try {
+      await waitForHttp(`${BROKER_URL}/healthz`, 120_000);
+    } catch (error) {
+      const logs = await run([...COMPOSE, "logs", "--no-color", "broker"], { env: composeEnv });
+      throw new Error(`${error instanceof Error ? error.message : String(error)}\nbroker logs:\n${logs.stdout}\n${logs.stderr}`);
+    }
 
     log("issuing a client token");
     const added = await runOrDie([
@@ -173,15 +200,20 @@ async function main() {
     log(`  exec #2 (fast path):          ${secondMs} ms`);
     log(`  total wall clock:             ${Date.now() - started} ms`);
   } finally {
+    if (process.env.SMOKE_KEEP === "1") {
+      log("SMOKE_KEEP=1 — leaving the compose stack and secret files in place for debugging");
+      return;
+    }
     if (composeUp) {
       log("tearing down compose project");
       await run([...COMPOSE, "down", "-v"], {
-        env: { BW_EMAIL: EMAIL, TELEGRAM_CHAT_ID: "0", TELEGRAM_ALLOWED_USER_IDS: "1", VAULT_URL: "http://vaultwarden" },
+        env: { BW_EMAIL: EMAIL, TELEGRAM_CHAT_ID: "0", TELEGRAM_ALLOWED_USER_IDS: "1" },
       });
     }
     for (const name of ["bw_clientid", "bw_clientsecret", "bw_password", "telegram_bot_token"]) {
       rmSync(join(DEPLOY, "secrets", name), { force: true });
     }
+    rmSync(TLS_DIR, { recursive: true, force: true });
     rmSync(scratch, { recursive: true, force: true });
   }
 }

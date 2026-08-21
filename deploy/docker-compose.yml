@@ -3,7 +3,6 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
-    platform: linux/amd64 # bw CLI ships x64-only
     ports:
       - "8787:8787"
     restart: unless-stopped
@@ -13,7 +12,13 @@ services:
       # Compose-internal vaultwarden (--profile vaultwarden). To use another
       # vault, set e.g. VAULT_URL=https://vault.bitwarden.com or your own
       # https://vaultwarden.example.com.
-      VAULT_URL: ${VAULT_URL:-http://vaultwarden}
+      # NOTE: the URL must be https — the bw CLI refuses plain-http servers.
+      # For the bundled vaultwarden that means terminating TLS in the
+      # vaultwarden container (see "TLS for the bundled vaultwarden" in
+      # README.md) and trusting its cert via NODE_EXTRA_CA_CERTS below.
+      VAULT_URL: ${VAULT_URL:-https://vaultwarden}
+      # Extra CA bundle for a self-signed/internal vaultwarden cert (optional).
+      # NODE_EXTRA_CA_CERTS: /vw-tls/cert.pem
       BW_EMAIL: ${BW_EMAIL}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
       TELEGRAM_ALLOWED_USER_IDS: ${TELEGRAM_ALLOWED_USER_IDS}
@@ -50,6 +55,13 @@ services:
     environment:
       # Needed once to create the automation account; set to "false" afterwards.
       SIGNUPS_ALLOWED: ${SIGNUPS_ALLOWED:-true}
+      # The broker's bw CLI requires https. Generate a cert whose SAN covers
+      # "vaultwarden" (see README) and mount it below, or front vaultwarden
+      # with your own TLS proxy and point VAULT_URL at that instead.
+      # ROCKET_TLS: '{certs="/ssl/cert.pem",key="/ssl/key.pem"}'
+      # ROCKET_PORT: "443"  # so the default https://vaultwarden (=:443) works
+    # volumes:
+    #   - ./vw-tls:/ssl:ro
     # Publish temporarily for initial account setup via browser, then remove.
     # ports:
     #   - "8222:80"

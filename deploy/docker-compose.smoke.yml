@@ -1,13 +1,24 @@
 # Overlay for the local end-to-end smoke test (deploy/smoke.ts). Never use in
-# production: it publishes vaultwarden on localhost and enables the dev
-# auto-approver so no Telegram bot is needed.
+# production: it publishes vaultwarden on localhost, enables the dev
+# auto-approver, and wires a throwaway self-signed TLS cert (the bw CLI
+# refuses plain-http vault servers, so even the smoke stack terminates TLS).
 services:
   broker:
     environment:
       SECRETARY_DEV_AUTO_APPROVE: "1"
       NODE_ENV: development
+      VAULT_URL: https://vaultwarden
+      NODE_EXTRA_CA_CERTS: /ssl/cert.pem
+    volumes:
+      - ./smoke-tls:/ssl:ro
   vaultwarden:
     ports:
-      - "127.0.0.1:18222:80"
+      - "127.0.0.1:18222:443"
     environment:
       SIGNUPS_ALLOWED: "true"
+      I_REALLY_WANT_VOLATILE_STORAGE: "true"
+      ROCKET_TLS: '{certs="/ssl/cert.pem",key="/ssl/key.pem"}'
+      # Serve on 443 so the broker's plain "https://vaultwarden" URL works.
+      ROCKET_PORT: "443"
+    volumes:
+      - ./smoke-tls:/ssl:ro
