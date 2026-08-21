@@ -1,55 +1,92 @@
 #!/bin/sh
-# One-shot installer for the secretary CLI and its agent-facing skill.
+# Installer for the secretary CLI (the client half).
 #
 #   curl -fsSL https://raw.githubusercontent.com/broven/secretary/main/install.sh | sh
 #
-# or, from a checkout:   sh install.sh
+# Downloads the prebuilt binary for this platform from a GitHub Release,
+# verifies its checksum, and puts `approved-secret` on your PATH. No bun,
+# no compiler, no git.
 #
-# Installs:
-#   <skill dir>/SKILL.md              the agent-facing contract
-#   <skill dir>/bin/secretary-core    the compiled CLI
-#   <skill dir>/scripts/approved-secret   entrypoint wrapper (env-scrubbing)
-#   <bin dir>/approved-secret         symlink onto PATH
+# The agent-facing skill is installed separately, so you can choose which
+# agents get it:
+#   npx skills add broven/secretary --skill use-approved-secrets
 #
-# Override with SECRETARY_SKILL_DIR / SECRETARY_BIN_DIR.
+# Environment overrides:
+#   SECRETARY_VERSION   release tag to install (default: latest)
+#   SECRETARY_DIR       where the binary and wrapper live
+#   SECRETARY_BIN_DIR   directory to link `approved-secret` into
 set -eu
 
 REPO=${SECRETARY_REPO:-broven/secretary}
-REF=${SECRETARY_REF:-main}
-skill_dir=${SECRETARY_SKILL_DIR:-"$HOME/.agents/skills/use-approved-secrets"}
+install_dir=${SECRETARY_DIR:-"$HOME/.local/share/secretary"}
 bin_dir=${SECRETARY_BIN_DIR:-"$HOME/.local/bin"}
 
 die() { echo "error: $*" >&2; exit 1; }
 
-# The CLI is a compiled Bun binary; there is no prebuilt artifact to fall back on.
-command -v bun >/dev/null 2>&1 || die "bun is required to build the CLI — install it from https://bun.sh then re-run"
+for tool in curl tar; do
+  command -v "$tool" >/dev/null 2>&1 || die "$tool is required"
+done
 
-# Prefer the checkout this script sits in; otherwise fetch a tarball (no git needed).
-script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P) || script_dir=""
-if [ -n "$script_dir" ] && [ -f "$script_dir/cli/build.sh" ] && [ -d "$script_dir/skills/use-approved-secrets" ]; then
-  src=$script_dir
-  cleanup() { :; }
+case "$(uname -s)" in
+  Darwin) os=darwin ;;
+  Linux)  os=linux ;;
+  *) die "unsupported OS: $(uname -s) — secretary ships macOS and Linux builds" ;;
+esac
+case "$(uname -m)" in
+  arm64|aarch64) arch=arm64 ;;
+  x86_64|amd64)  arch=x64 ;;
+  *) die "unsupported architecture: $(uname -m)" ;;
+esac
+asset="secretary-$os-$arch.tar.gz"
+
+version=${SECRETARY_VERSION:-}
+if [ -z "$version" ]; then
+  echo "resolving latest release of $REPO …"
+  version=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
+    | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+  [ -n "$version" ] || die "could not resolve the latest release — pass SECRETARY_VERSION=<tag>"
+fi
+base="https://github.com/$REPO/releases/download/$version"
+
+work=$(mktemp -d) || die "cannot create a temporary directory"
+trap 'rm -rf "$work"' EXIT INT TERM
+
+echo "downloading $asset ($version) …"
+curl -fsSL "$base/$asset" -o "$work/$asset" || die "download failed — does $version ship $asset?"
+
+# Checksums are published with the release; a silently corrupted or swapped
+# binary is exactly the thing this tool must not be.
+if curl -fsSL "$base/SHA256SUMS" -o "$work/SHA256SUMS" 2>/dev/null; then
+  expected=$(grep " $asset\$" "$work/SHA256SUMS" | awk '{print $1}' | head -1)
+  [ -n "$expected" ] || die "SHA256SUMS has no entry for $asset"
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual=$(sha256sum "$work/$asset" | awk '{print $1}')
+  elif command -v shasum >/dev/null 2>&1; then
+    actual=$(shasum -a 256 "$work/$asset" | awk '{print $1}')
+  else
+    die "need sha256sum or shasum to verify the download"
+  fi
+  [ "$expected" = "$actual" ] || die "checksum mismatch for $asset — refusing to install"
+  echo "checksum ok"
 else
-  command -v curl >/dev/null 2>&1 || die "curl is required to download the source"
-  command -v tar >/dev/null 2>&1 || die "tar is required to unpack the source"
-  work=$(mktemp -d) || die "cannot create a temporary directory"
-  cleanup() { rm -rf "$work"; }
-  trap cleanup EXIT INT TERM
-  echo "fetching $REPO@$REF …"
-  curl -fsSL "https://codeload.github.com/$REPO/tar.gz/refs/heads/$REF" \
-    | tar -xzf - -C "$work" || die "download failed — is the repository public and is '$REF' a branch?"
-  src=$(find "$work" -maxdepth 1 -mindepth 1 -type d | head -1)
-  [ -n "$src" ] || die "unexpected archive layout"
+  die "no SHA256SUMS published for $version — refusing to install unverified"
 fi
 
-[ -f "$src/skills/use-approved-secrets/install.sh" ] || die "source tree is missing the skill installer"
-SECRETARY_SKILL_DEST="$skill_dir" sh "$src/skills/use-approved-secrets/install.sh" "$skill_dir"
+tar -xzf "$work/$asset" -C "$work" || die "could not unpack $asset"
+[ -f "$work/secretary-core" ] || die "archive is missing secretary-core"
+[ -f "$work/approved-secret" ] || die "archive is missing the entrypoint wrapper"
 
-# Put the entrypoint on PATH. A symlink (not a copy) so the next install is picked
-# up without touching this directory again.
-mkdir -p "$bin_dir"
-ln -sf "$skill_dir/scripts/approved-secret" "$bin_dir/approved-secret"
-echo "linked: $bin_dir/approved-secret"
+mkdir -p "$install_dir/bin" "$install_dir/scripts" "$bin_dir"
+install -m 755 "$work/secretary-core" "$install_dir/bin/secretary-core"
+# The wrapper locates the binary relative to its own directory, which breaks
+# once it is reached through a symlink on PATH ($0 is then the symlink). Bake
+# the absolute path in at install time.
+sed 's|"$script_dir/../bin/secretary-core"|"'"$install_dir"'/bin/secretary-core"|' \
+  "$work/approved-secret" > "$install_dir/scripts/approved-secret"
+chmod 755 "$install_dir/scripts/approved-secret"
+ln -sf "$install_dir/scripts/approved-secret" "$bin_dir/approved-secret"
+
+echo "installed: $("$install_dir/bin/secretary-core" --version) -> $bin_dir/approved-secret"
 
 case ":${PATH}:" in
   *":$bin_dir:"*) ;;
@@ -58,13 +95,17 @@ esac
 
 cat <<'NEXT'
 
-Done. Two bootstrap steps remain, and both are yours to run — a token must never
-be pasted into an agent's conversation:
+Next:
 
-  approved-secret auth set-url https://your-broker.example
-  approved-secret auth import        # paste the token issued by `secretary client add`
+  1. Install the skill for your agents (interactive — pick which ones):
+       npx skills add broven/secretary --skill use-approved-secrets
 
-Then check it works:
+  2. Point the CLI at your broker and store its token. Both are yours to run:
+     a token must never be pasted into an agent's conversation.
+       approved-secret auth set-url https://your-broker.example
+       approved-secret auth set-client-id <client_id>
+       approved-secret auth import
 
-  approved-secret list
+  3. Check it works:
+       approved-secret list
 NEXT

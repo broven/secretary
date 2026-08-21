@@ -39,12 +39,29 @@ const MAX_BODY_BYTES = 256 * 1024;
  * intermediaries from killing an idle-looking connection during a 300 s approval. */
 const HEARTBEAT_INTERVAL_MS = 20_000;
 
-function json(status: number, value: unknown): Response {
+function json(status: number, value: unknown, closeConnection = false): Response {
   return new Response(JSON.stringify(value), {
     status,
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      // See closeAfterUnreadBody().
+      ...(closeConnection ? { Connection: "close" } : {}),
+    },
   });
 }
+
+/**
+ * A response that refuses to read the rest of the request body must close the
+ * connection.
+ *
+ * We answer an oversized upload as soon as the cap is passed, while the client
+ * is still sending. Keeping that connection alive leaves unread bytes in the
+ * pipe, and whatever the peer sends next is read as the start of a new request
+ * — the next response then carries a status belonging to nobody (a stray 431
+ * was how this surfaced). Closing is the only correct end to a half-read
+ * request.
+ */
+const closeAfterUnreadBody = true;
 
 /** Read the request body, throwing as soon as the byte count passes maxBytes. */
 async function readBodyLimited(request: Request, maxBytes: number): Promise<string> {
@@ -154,16 +171,16 @@ function longPollResponse(
   });
 }
 
-type BodyOutcome = { value: unknown } | { error: string; status: number };
+type BodyOutcome = { value: unknown } | { error: string; status: number; close?: boolean };
 
 async function readJsonBody(request: Request): Promise<BodyOutcome> {
   const lengthHeader = Number(request.headers.get("content-length") ?? 0);
-  if (lengthHeader > MAX_BODY_BYTES) return { error: "body too large", status: 413 };
+  if (lengthHeader > MAX_BODY_BYTES) return { error: "body too large", status: 413, close: true };
   let text: string;
   try {
     text = await readBodyLimited(request, MAX_BODY_BYTES);
   } catch {
-    return { error: "body too large", status: 413 };
+    return { error: "body too large", status: 413, close: true };
   }
   try {
     return { value: JSON.parse(text) };
@@ -182,8 +199,11 @@ async function readEntryFormLimited(request: Request): Promise<FormData> {
   return new Response(text, { headers }).formData();
 }
 
-function html(status: number, body: string): Response {
-  return new Response(body, { status, headers: ENTRY_HEADERS });
+function html(status: number, body: string, closeConnection = false): Response {
+  return new Response(body, {
+    status,
+    headers: closeConnection ? { ...ENTRY_HEADERS, Connection: "close" } : ENTRY_HEADERS,
+  });
 }
 
 /**
@@ -205,13 +225,15 @@ async function handleEntry(
   if (request.method !== "POST") return html(405, renderEntryGone());
 
   const found = writes.entries.find(nonce);
-  if (!found) return html(404, renderEntryGone());
+  // Answered without reading the body at all — same reasoning as above.
+  if (!found) return html(404, renderEntryGone(), closeAfterUnreadBody);
 
   let form: FormData;
   try {
     form = await readEntryFormLimited(request);
   } catch {
-    return html(400, renderEntryPage(found, "表单读取失败，请重试。"));
+    // The body was refused mid-upload, so the connection must not be reused.
+    return html(400, renderEntryPage(found, "表单读取失败，请重试。"), closeAfterUnreadBody);
   }
   const values = new Map<string, string>();
   for (const field of found.owner_fields) {
@@ -271,7 +293,7 @@ export function startHttpServer(deps: HttpDeps) {
 
       if (url.pathname === "/v1/writes" && request.method === "POST") {
         const body = await readJsonBody(request);
-        if ("error" in body) return json(body.status, { error: body.error });
+        if ("error" in body) return json(body.status, { error: body.error }, body.close === true);
         let pending: Promise<unknown>;
         try {
           pending = deps.writes.handle(body.value, client);

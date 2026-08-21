@@ -1,6 +1,10 @@
 #!/bin/sh
-# Install the agent-facing skill: SKILL.md (the contract), the entrypoint
-# wrapper, and the compiled CLI.
+# Development install: build the CLI from this checkout and install it together
+# with the skill.
+#
+# END USERS DO NOT NEED THIS. They install the prebuilt CLI with the root
+# install.sh and the skill with `npx skills add`. This script exists so that a
+# change to cli/src is one command away from being exercised for real.
 #
 # The contract lives in this repo next to the CLI that implements it. The last
 # time they lived apart, the CLI was rewritten and the doc kept describing the

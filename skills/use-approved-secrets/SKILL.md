@@ -5,6 +5,20 @@ description: Discover, use, and record Bitwarden-backed credentials through the 
 
 # Use Approved Secrets
 
+## Prerequisite
+
+This skill describes how to drive the `approved-secret` command. Installing the
+skill does not install that command. If it is missing, stop and tell the user to
+run:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/broven/secretary/main/install.sh | sh
+```
+
+Then they point it at their broker themselves — `auth set-url`, `auth
+set-client-id`, `auth import`. Never ask for, accept, or echo the token.
+
+
 Credentials live in a Bitwarden/Vaultwarden vault. The `approved-secret` command talks
 to the secretary broker, which is the only thing that ever holds plaintext. You can:
 

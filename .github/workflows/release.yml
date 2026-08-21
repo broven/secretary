@@ -1,0 +1,66 @@
+name: release
+
+# Tagging is the release: push v* and the binaries appear on the Release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build (must already exist)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - run: bun install --frozen-lockfile
+
+      # The whole suite, not just the CLI's: a broker change that breaks the
+      # wire contract must not ship a client that speaks it.
+      - name: Test
+        run: bun test
+
+      - name: Build every target
+        env:
+          SECRETARY_VERSION: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -eu
+          mkdir -p dist
+          for target in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+            echo "::group::$target"
+            stage="dist/stage-$target"
+            mkdir -p "$stage"
+            SECRETARY_TARGET="bun-$target" \
+            SECRETARY_OUTFILE="$PWD/$stage/secretary-core" \
+              sh cli/build.sh
+            # The wrapper travels with the binary; the installer rewrites its
+            # binary path to an absolute one at install time.
+            cp cli/scripts/secretary "$stage/approved-secret"
+            chmod 755 "$stage/approved-secret"
+            tar -czf "dist/secretary-$target.tar.gz" -C "$stage" secretary-core approved-secret
+            rm -rf "$stage"
+            echo "::endgroup::"
+          done
+          cd dist && sha256sum secretary-*.tar.gz > SHA256SUMS && cat SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -eu
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --title "$TAG" --generate-notes
+          gh release upload "$TAG" dist/secretary-*.tar.gz dist/SHA256SUMS --clobber

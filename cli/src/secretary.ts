@@ -20,6 +20,10 @@ export const URL_ENV = "SECRETARY_URL";
 export const TOKEN_ENV = "SECRETARY_TOKEN";
 export const CLIENT_ENV = "SECRETARY_CLIENT_ID";
 
+/** Injected by cli/build.sh via --define; "dev" for an unreleased local build. */
+declare const SECRETARY_BUILD_VERSION: string | undefined;
+export const VERSION = typeof SECRETARY_BUILD_VERSION === "string" ? SECRETARY_BUILD_VERSION : "dev";
+
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ENV_NAME = /^[A-Z][A-Z0-9_]*$/;
 const RESERVED_ENV = new Set([
@@ -124,6 +128,7 @@ export type WriteOperation = "create" | "update" | "remove";
 export type WriteFieldSpec = { name: CatalogField; source: "inline" | "owner" };
 
 export type ParsedInvocation =
+  | { action: "version" }
   | { action: "list"; cwd: string; query: string; json: boolean }
   | {
     action: "write";
@@ -335,6 +340,9 @@ const AUTH_ACTIONS_NO_VALUE: AuthAction[] = ["import", "status", "delete"];
 const AUTH_ACTIONS_WITH_VALUE: AuthAction[] = ["set-url", "set-client-id"];
 
 export function parseInvocation(args: string[]): ParsedInvocation {
+  // Answered before the --cwd contract so `approved-secret --version` works
+  // no matter how the entrypoint was reached.
+  if (args.includes("--version") || args.includes("-v")) return { action: "version" };
   // The wrapper script always injects `--cwd <caller dir>` first.
   if (args[0] !== "--cwd" || !args[1]) throw new Error("内部调用缺少 --cwd");
   const cwd = args[1];
@@ -369,7 +377,7 @@ export function parseInvocation(args: string[]): ParsedInvocation {
     if (command.some((part) => part.length > MAX_ARGV_ENTRY_LENGTH)) throw new Error("命令参数过长");
     return { action, cwd, items: parseItemGroups(tokens), command, reason };
   }
-  throw new Error("用法：secretary list|exec|create|update|remove|auth ...");
+  throw new Error("用法：secretary list|exec|create|update|remove|auth ...（--version 查看版本）");
 }
 
 function parseJson(text: string, context: string): unknown {
@@ -979,6 +987,10 @@ export async function main(args: string[], deps: ClientDeps = defaultDeps): Prom
   }
 
   try {
+    if (invocation.action === "version") {
+      deps.stdout(`${VERSION}\n`);
+      return 0;
+    }
     if (invocation.action === "auth") {
       await runAuth(invocation, deps);
       return 0;
