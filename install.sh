@@ -7,14 +7,15 @@
 # verifies its checksum, and puts `approved-secret` on your PATH. No bun,
 # no compiler, no git.
 #
-# The agent-facing skill is installed separately, so you can choose which
-# agents get it:
-#   npx skills add broven/secretary
+# Then offers to install the agent-facing skill via `npx skills add`, which
+# asks which agents and which scope. Skip it with SECRETARY_SKIP_SKILL=1 and
+# run `npx skills add broven/secretary` yourself whenever you like.
 #
 # Environment overrides:
 #   SECRETARY_VERSION   release tag to install (default: latest)
 #   SECRETARY_DIR       where the binary and wrapper live
 #   SECRETARY_BIN_DIR   directory to link `approved-secret` into
+#   SECRETARY_SKIP_SKILL=1   install only the CLI
 set -eu
 
 REPO=${SECRETARY_REPO:-broven/secretary}
@@ -93,19 +94,45 @@ case ":${PATH}:" in
   *) echo; echo "NOTE: $bin_dir is not on your PATH — add it, e.g.:"; echo "  export PATH=\"$bin_dir:\$PATH\"" ;;
 esac
 
+# --- the skill -------------------------------------------------------------
+#
+# Piped into `sh`, this script's stdin IS the pipe carrying its own text, so a
+# prompt here would read the script instead of the user. Hand the child a real
+# terminal; where there is none (CI, a background run), print the command
+# rather than guessing on the user's behalf.
+skill_cmd="npx skills add $REPO"
+
+if [ "${SECRETARY_SKIP_SKILL:-}" = "1" ]; then
+  echo
+  echo "skipped the skill. Install it whenever you like:  $skill_cmd"
+elif ! command -v npx >/dev/null 2>&1; then
+  echo
+  echo "npx not found, so the agent skill was not installed."
+  echo "Install Node.js, then run:  $skill_cmd"
+# `[ -r /dev/tty ]` only checks permission bits; with no controlling terminal
+# the file is there but opening it fails. Actually open it.
+elif { : </dev/tty; } 2>/dev/null; then
+  echo
+  echo "Installing the agent skill — it will ask which agents and which scope."
+  # shellcheck disable=SC2086
+  npx --yes skills add "$REPO" </dev/tty >/dev/tty 2>&1 \
+    || { echo; echo "the skill step failed; you can retry it any time:  $skill_cmd"; }
+else
+  echo
+  echo "No terminal available for the interactive skill installer. Run:"
+  echo "  $skill_cmd"
+fi
+
 cat <<'NEXT'
 
-Next:
+Last step, and it is yours alone — a token must never be pasted into an agent's
+conversation:
 
-  1. Install the skill for your agents (interactive — pick which ones):
-       npx skills add broven/secretary
+  approved-secret auth set-url https://your-broker.example
+  approved-secret auth set-client-id <client_id>
+  approved-secret auth import
 
-  2. Point the CLI at your broker and store its token. Both are yours to run:
-     a token must never be pasted into an agent's conversation.
-       approved-secret auth set-url https://your-broker.example
-       approved-secret auth set-client-id <client_id>
-       approved-secret auth import
+Then check it works:
 
-  3. Check it works:
-       approved-secret list
+  approved-secret list
 NEXT

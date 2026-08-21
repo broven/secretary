@@ -92,16 +92,18 @@ docker exec <broker> bun run /app/server/src/cli_admin.ts client add my-mac
 
 ### 3. Set up the agent machine
 
-Two commands. The first installs the CLI — a prebuilt binary for your platform,
-checksum-verified, no bun or compiler needed:
+One command. It installs the CLI — a prebuilt binary for your platform,
+checksum-verified, no bun or compiler needed — then hands you over to the skill
+installer, which asks which of your code agents should get it and whether to
+install for this project or user-wide:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/broven/secretary/main/install.sh | sh
 ```
 
-The second installs the agent-facing skill. It detects the code agents on the
-machine and sets them all up — add `-g` for a user-wide install instead of the
-current project:
+The skill step needs `npx`; without Node.js the CLI still installs and the
+command to run later is printed. `SECRETARY_SKIP_SKILL=1` skips it outright,
+and it can always be done separately:
 
 ```sh
 npx skills add broven/secretary
