@@ -8,6 +8,10 @@ services:
     restart: unless-stopped
     volumes:
       - broker-data:/data
+      # Uncomment together with NODE_EXTRA_CA_CERTS below to trust the
+      # bundled vaultwarden's self-signed cert (README: "TLS for the bundled
+      # vaultwarden").
+      # - ./vw-tls:/vw-tls:ro
     environment:
       # Compose-internal vaultwarden (--profile vaultwarden). To use another
       # vault, set e.g. VAULT_URL=https://vault.bitwarden.com or your own
@@ -52,16 +56,18 @@ services:
     restart: unless-stopped
     volumes:
       - vw-data:/data
+      # Uncomment together with ROCKET_TLS below (README: "TLS for the
+      # bundled vaultwarden").
+      # - ./vw-tls:/ssl:ro
     environment:
       # Needed once to create the automation account; set to "false" afterwards.
       SIGNUPS_ALLOWED: ${SIGNUPS_ALLOWED:-true}
       # The broker's bw CLI requires https. Generate a cert whose SAN covers
-      # "vaultwarden" (see README) and mount it below, or front vaultwarden
-      # with your own TLS proxy and point VAULT_URL at that instead.
+      # "vaultwarden" (see README), mount it via the ./vw-tls volume above,
+      # and uncomment both lines — or front vaultwarden with your own TLS
+      # proxy and point VAULT_URL at that instead.
       # ROCKET_TLS: '{certs="/ssl/cert.pem",key="/ssl/key.pem"}'
       # ROCKET_PORT: "443"  # so the default https://vaultwarden (=:443) works
-    # volumes:
-    #   - ./vw-tls:/ssl:ro
     # Publish temporarily for initial account setup via browser, then remove.
     # ports:
     #   - "8222:80"
