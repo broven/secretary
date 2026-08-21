@@ -8,17 +8,20 @@ const OTHER_USER = 999;
 
 let fake: FakeTelegram;
 let approver: TelegramApprover;
-let revokedCalls: string[][];
+let revokedCalls: string[];
+// A durable-store stand-in: sighting id -> number of grant rows it deletes.
+let revokeHandles: Map<string, number>;
 
 beforeEach(async () => {
   fake = await startFakeTelegram();
   revokedCalls = [];
+  revokeHandles = new Map();
   approver = new TelegramApprover(
     { botToken: "TEST_TOKEN", chatId: "555", allowedUserIds: [ALLOWED_USER], apiBase: fake.url },
     {
-      onRevoke: (grantKeys) => {
-        revokedCalls.push(grantKeys);
-        return grantKeys.length;
+      onRevoke: (sightingId) => {
+        revokedCalls.push(sightingId);
+        return revokeHandles.get(sightingId) ?? null;
       },
     },
     { log: () => {} },
@@ -178,8 +181,9 @@ test("no press within timeoutMs resolves timeout", async () => {
   expect(result).toEqual({ approved: false, reason: "timeout" });
 });
 
-test("notifySighting sends a revoke button and pressing it calls onRevoke", async () => {
+test("notifySighting sends a revoke button and pressing it calls onRevoke by id", async () => {
   const card = makeSightingCard();
+  revokeHandles.set(card.id, 2);
   await approver.notifySighting(card);
   expect(fake.sentMessages.length).toBe(1);
   expect(fake.sentMessages[0].text).toContain("密钥免审复用");
@@ -192,9 +196,35 @@ test("notifySighting sends a revoke button and pressing it calls onRevoke", asyn
 
   fake.pressButton(`rv:${card.id}`, ALLOWED_USER);
   await waitFor(() => revokedCalls.length === 1);
-  expect(revokedCalls[0]).toEqual(["grant:a", "grant:b"]);
+  expect(revokedCalls[0]).toBe(card.id);
   await waitFor(() => fake.answeredCallbacks.length === 1);
   expect(fake.answeredCallbacks[0].text).toBe("已吊销 2 行");
+});
+
+test("an unresolvable revoke handle answers honestly instead of claiming success (P1-c)", async () => {
+  const card = makeSightingCard();
+  await approver.notifySighting(card);
+  // No entry in the durable store (e.g. it was swept): must NOT say 已吊销.
+  fake.pressButton(`rv:${card.id}`, ALLOWED_USER);
+  await waitFor(() => fake.answeredCallbacks.length === 1);
+  expect(fake.answeredCallbacks[0].text).toContain("无法识别");
+  expect(fake.answeredCallbacks[0].text).not.toContain("已吊销");
+});
+
+test("the approval card always shows the field mapping before a long description (P1-b)", async () => {
+  const card = makeCard({
+    items: [{
+      name: "Registry Token",
+      description: "x".repeat(1000),
+      bindings: [{ field: "password", env: "REGISTRY_TOKEN" }],
+    }],
+  });
+  const decision = approver.requestApproval(card, 5000);
+  await waitFor(() => fake.sentMessages.length === 1);
+  const text = fake.sentMessages[0].text;
+  expect(text).toContain("password → REGISTRY_TOKEN");
+  fake.pressButton(`ap:${card.id}:deny`, ALLOWED_USER);
+  await decision;
 });
 
 test("HTML in the command arrives escaped", async () => {

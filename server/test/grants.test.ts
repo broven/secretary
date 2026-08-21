@@ -278,3 +278,48 @@ describe("save validation", () => {
     expect(grant.decided_at).toBe("2026-08-21T00:00:00.000Z");
   });
 });
+
+describe("durable revoke handles (P1-c)", () => {
+  test("a handle persisted in SQLite resolves and revokes across store instances", () => {
+    const db = new Database(":memory:");
+    let nowMs = Date.parse("2030-01-01T00:00:00.000Z");
+    const store = new GrantStore(db, () => nowMs);
+    const saved = store.save(identity, [unitA, unitB], "7d", APPROVAL_ID);
+    const keys = saved.map((grant) => grant.grant_key);
+    const handle = "11111111-2222-4333-8444-555555555555";
+    store.saveRevokeHandle(handle, keys);
+
+    // Simulate a broker restart: a brand-new GrantStore over the same db.
+    const restarted = new GrantStore(db, () => nowMs);
+    expect(restarted.revokeByHandle(handle)).toBe(2);
+    expect(restarted.findActive(keys).size).toBe(0);
+    // Pressing again is honest but harmless: known handle, zero rows left.
+    expect(restarted.revokeByHandle(handle)).toBe(0);
+  });
+
+  test("unknown or invalid handles resolve to null, never a fake success", () => {
+    const store = new GrantStore(new Database(":memory:"));
+    expect(store.revokeByHandle("99999999-2222-4333-8444-555555555555")).toBeNull();
+    expect(store.revokeByHandle("not a handle!")).toBeNull();
+  });
+
+  test("handles are swept after the retention window", () => {
+    const db = new Database(":memory:");
+    let nowMs = Date.parse("2030-01-01T00:00:00.000Z");
+    const store = new GrantStore(db, () => nowMs);
+    const saved = store.save(identity, [unitA], "1h", APPROVAL_ID);
+    const handle = "11111111-2222-4333-8444-555555555555";
+    store.saveRevokeHandle(handle, saved.map((grant) => grant.grant_key));
+    nowMs += 91 * DAY_MS;
+    store.sweep();
+    expect(store.revokeByHandle(handle)).toBeNull();
+  });
+
+  test("handle validation", () => {
+    const store = new GrantStore(new Database(":memory:"));
+    const key = secretGrantKey(identity, unitA);
+    expect(() => store.saveRevokeHandle("bad handle", [key])).toThrow("invalid revoke handle");
+    expect(() => store.saveRevokeHandle("11111111-2222-4333-8444-555555555555", [])).toThrow();
+    expect(() => store.saveRevokeHandle("11111111-2222-4333-8444-555555555555", ["nothex"])).toThrow();
+  });
+});

@@ -44,6 +44,40 @@ describe("inline shell detection (ported table)", () => {
     expect(isInlineShellCommand(["env", "-u"])).toBe(false);
   });
 
+  test("combined and equivalent eval flags are inline (P1-a)", () => {
+    const inline: string[][] = [
+      ["sh", "-cx", "echo hi"],
+      ["bash", "-xc", "echo hi"],
+      ["zsh", "-ilc", "echo hi"],
+      ["python3", "-uc", "print(1)"],
+      ["node", "-p", "1+1"],
+      ["node", "--print", "1+1"],
+      ["node", "--print=1+1"],
+      ["node", "--eval=1"],
+      ["bun", "-p", "1"],
+      ["deno", "-p", "1"],
+      ["perl", "-we", "print 1"],
+      ["perl", "-E", "say 1"],
+      ["ruby", "-e", "puts 1"],
+      ["ruby", "-ne", "print"],
+      ["php", "-r", "echo 1;"],
+    ];
+    for (const argv of inline) {
+      expect({ argv, inline: isInlineShellCommand(argv) }).toEqual({ argv, inline: true });
+    }
+    const notInline: string[][] = [
+      ["sh", "-x", "script.sh"],
+      ["bash", "-l", "script.sh"],
+      ["python3", "-u", "script.py"],
+      ["node", "--version"],
+      ["node", "script.js", "--print-config"],
+      ["php", "-f", "script.php"],
+    ];
+    for (const argv of notInline) {
+      expect({ argv, inline: isInlineShellCommand(argv) }).toEqual({ argv, inline: false });
+    }
+  });
+
   test("plain commands are not inline", () => {
     expect(isInlineShellCommand(["curl", "-c", "cookies.txt", "https://x"])).toBe(false);
     expect(isInlineShellCommand(["python3", "script.py"])).toBe(false);

@@ -26,6 +26,7 @@ import { isValidFieldName } from "./vault.ts";
 
 export const SECRET_GRANT_TABLE = "secret_grants";
 export const SECRET_SIGHTING_TABLE = "secret_command_sightings";
+export const REVOKE_HANDLE_TABLE = "secret_revoke_handles";
 
 /** Sightings only answer "have we seen this command"; 90 days covers the
  * reuse window of the longest 7d grant. */
@@ -233,6 +234,46 @@ export class GrantStore {
         last_seen_at INTEGER NOT NULL
       )
     `);
+    // Durable mapping behind Sighting revoke buttons: the Telegram
+    // callback_data carries only a short handle (64-byte cap), the grant keys
+    // live here — so the button keeps working across broker restarts.
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS ${REVOKE_HANDLE_TABLE} (
+        handle TEXT PRIMARY KEY,
+        grant_keys TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `);
+  }
+
+  /** Persist the handle → grant-keys mapping for a Sighting's revoke button. */
+  saveRevokeHandle(handle: string, grantKeys: string[]): void {
+    const keys = [...new Set((grantKeys || []).map(assertSecretGrantKey))];
+    if (!/^[A-Za-z0-9-]{8,80}$/.test(handle)) throw new Error("invalid revoke handle");
+    if (keys.length === 0 || keys.length > 40) throw new Error("invalid revoke handle key count");
+    this.db.run(
+      `INSERT INTO ${REVOKE_HANDLE_TABLE} (handle, grant_keys, created_at) VALUES (?, ?, ?)
+       ON CONFLICT(handle) DO UPDATE SET grant_keys = excluded.grant_keys`,
+      [handle, JSON.stringify(keys), this.now()],
+    );
+  }
+
+  /** Resolve a revoke handle and delete its grant rows. Null = unknown handle. */
+  revokeByHandle(handle: string): number | null {
+    if (!/^[A-Za-z0-9-]{8,80}$/.test(handle)) return null;
+    const row = this.db
+      .query<{ grant_keys: string }, [string]>(
+        `SELECT grant_keys FROM ${REVOKE_HANDLE_TABLE} WHERE handle = ?`,
+      )
+      .get(handle);
+    if (!row) return null;
+    let keys: string[];
+    try {
+      keys = (JSON.parse(row.grant_keys) as string[]).map(assertSecretGrantKey);
+    } catch {
+      return null;
+    }
+    return this.revoke(keys);
   }
 
   /**
@@ -373,6 +414,12 @@ export class GrantStore {
     this.db.run(`DELETE FROM ${SECRET_GRANT_TABLE} WHERE expires_at <= ?`, [nowMs]);
     this.db.run(
       `DELETE FROM ${SECRET_SIGHTING_TABLE} WHERE last_seen_at < ?`,
+      [nowMs - SIGHTING_RETENTION_MS],
+    );
+    // Revoke handles share the sighting retention window: long past the max
+    // 7-day grant TTL, so a resolvable handle always outlives its grants.
+    this.db.run(
+      `DELETE FROM ${REVOKE_HANDLE_TABLE} WHERE created_at < ?`,
       [nowMs - SIGHTING_RETENTION_MS],
     );
   }

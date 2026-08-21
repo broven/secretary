@@ -28,6 +28,9 @@ import { isSecretGrantTtl, type ApprovalTtl } from "./types.ts";
 export const MAX_TELEGRAM_FIELDS = 6;
 /** Character budget for a plain field value. */
 export const FIELD_VALUE_LIMIT = 320;
+/** Free-form item notes get their own smaller budget so they can never crowd
+ * the decision-critical field mapping out of the 320-char field value. */
+export const ITEM_DESCRIPTION_LIMIT = 120;
 /**
  * Character budget for a block (code) field. Must be wide enough to hold the
  * caller's already-truncated command display including its fingerprint suffix,
@@ -105,9 +108,13 @@ function approvalFields(card: ApprovalCard): CardField[] {
       : []),
     ...card.items.map((item, index) => ({
       label: `密钥 ${index + 1} · ${item.name}`,
+      // Decision-critical mapping FIRST: the Owner must always see exactly
+      // which credential fields are being granted. Only the free-form item
+      // description is truncated, on its own smaller budget, so a long notes
+      // text can never push the mapping off the card.
       value: [
-        item.description || "（未填写 notes 描述）",
         `字段映射：${item.bindings.map((binding) => `${binding.field} → ${binding.env}`).join("，")}`,
+        limit(item.description || "（未填写 notes 描述）", ITEM_DESCRIPTION_LIMIT),
       ].join("\n"),
       monospace: false,
     })),
@@ -216,8 +223,6 @@ export function buildSightingKeyboard(card: SightingCard): TelegramInlineKeyboar
 // Approver
 // ---------------------------------------------------------------------------
 
-/** Sighting revoke buttons expire with the longest possible grant TTL (7 days). */
-const SIGHTING_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const POLL_TIMEOUT_S = 25;
 const RETRY_BACKOFF_MS = 1500;
 
@@ -236,8 +241,6 @@ type PendingApproval = {
   inlineShell: boolean;
 };
 
-type StoredSighting = { grantKeys: string[]; expiresAtMs: number };
-
 export type TelegramApproverConfig = {
   botToken: string;
   chatId: string;
@@ -246,8 +249,13 @@ export type TelegramApproverConfig = {
 };
 
 export type TelegramApproverHooks = {
-  /** Deletes the given grant rows; returns the number of rows removed. */
-  onRevoke: (grantKeys: string[]) => Promise<number> | number;
+  /**
+   * Revoke the grants behind a Sighting card by its id, resolved through a
+   * DURABLE store (SQLite) so the button keeps working across broker
+   * restarts. Returns the number of rows removed, or null when the id cannot
+   * be resolved (unknown/expired handle).
+   */
+  onRevoke: (sightingId: string) => Promise<number | null> | number | null;
 };
 
 export type TelegramApproverDeps = {
@@ -267,7 +275,6 @@ export class TelegramApprover implements Approver {
   private readonly now: () => number;
 
   private readonly pending = new Map<string, PendingApproval>();
-  private readonly sightings = new Map<string, StoredSighting>();
   private abortController: AbortController | null = null;
   private offset = 0;
 
@@ -345,17 +352,15 @@ export class TelegramApprover implements Approver {
 
   async notifySighting(card: SightingCard): Promise<void> {
     try {
-      this.pruneSightings();
+      // The revoke button carries only the card id; the id → grant-keys
+      // mapping lives in the durable store behind hooks.onRevoke, so the
+      // button survives broker restarts.
       await this.api("sendMessage", {
         chat_id: this.chatId,
         text: buildSightingText(card),
         parse_mode: "HTML",
         disable_web_page_preview: true,
         reply_markup: buildSightingKeyboard(card),
-      });
-      this.sightings.set(card.id, {
-        grantKeys: [...card.grant_keys],
-        expiresAtMs: this.now() + SIGHTING_RETENTION_MS,
       });
     } catch (error) {
       // Best-effort by contract: a Sighting never blocks an execution.
@@ -437,22 +442,22 @@ export class TelegramApprover implements Approver {
     fromId: number,
     callback: TelegramCallbackQuery,
   ): Promise<void> {
-    const entry = this.sightings.get(cardId);
-    if (!entry || entry.expiresAtMs <= this.now()) {
-      await this.answerCallback(callbackId, "已处理");
-      return;
-    }
     if (!this.allowedUserIds.includes(fromId)) {
       await this.answerCallback(callbackId, "无权审批");
       return;
     }
-    this.sightings.delete(cardId);
-    let removed = 0;
+    let removed: number | null = null;
     try {
-      removed = await this.hooks.onRevoke(entry.grantKeys);
+      removed = await this.hooks.onRevoke(cardId);
     } catch (error) {
       this.log(`telegram revoke hook failed: ${errorMessage(error)}`);
       await this.answerCallback(callbackId, "吊销失败，请检查服务端日志");
+      return;
+    }
+    if (removed === null) {
+      // Honest answer: the handle cannot be resolved (e.g. pre-dates the
+      // durable store or was swept) — never claim the grants are gone.
+      await this.answerCallback(callbackId, "无法识别该通知，未吊销任何授权；请手动检查");
       return;
     }
     await this.answerCallback(callbackId, `已吊销 ${removed} 行`);
@@ -508,12 +513,6 @@ export class TelegramApprover implements Approver {
     }
   }
 
-  private pruneSightings(): void {
-    const now = this.now();
-    for (const [id, entry] of this.sightings) {
-      if (entry.expiresAtMs <= now) this.sightings.delete(id);
-    }
-  }
 }
 
 function decisionForAction(

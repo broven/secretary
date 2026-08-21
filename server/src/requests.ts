@@ -48,7 +48,6 @@ export class RequestError extends Error {
 export const MAX_COMMAND_DISPLAY = 900;
 
 const SHELL_BINARIES = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh"]);
-const INLINE_INTERPRETERS = new Set(["python", "python3", "perl", "ruby", "node", "bun", "deno", "php"]);
 
 /**
  * Inline shell / interpreter code detection.
@@ -94,9 +93,20 @@ export function isInlineShellCommand(argv: string[]): boolean {
   }
   const binary = (parts[0].split("/").pop() || "").toLowerCase();
   const flags = parts.slice(1);
-  if (SHELL_BINARIES.has(binary)) return flags.some((flag) => /^-[a-zA-Z]*c$/.test(flag));
-  if (INLINE_INTERPRETERS.has(binary)) {
-    return flags.some((flag) => flag === "-c" || flag === "-e" || flag === "-E" || flag === "--eval");
+  // A short-option cluster (-cx, -we, -lc…) counts as eval when it contains
+  // any of the given letters — combined forms must not slip past detection.
+  const clusterHas = (flag: string, letters: string): boolean =>
+    /^-[A-Za-z0-9]+$/.test(flag) && [...flag.slice(1)].some((letter) => letters.includes(letter));
+  if (SHELL_BINARIES.has(binary)) return flags.some((flag) => clusterHas(flag, "c"));
+  if (binary === "python" || binary === "python3") return flags.some((flag) => clusterHas(flag, "c"));
+  if (binary === "perl" || binary === "ruby") return flags.some((flag) => clusterHas(flag, "eE"));
+  if (binary === "php") return flags.some((flag) => clusterHas(flag, "rR"));
+  if (binary === "node" || binary === "bun" || binary === "deno") {
+    return flags.some((flag) =>
+      clusterHas(flag, "ep") ||
+      flag === "--eval" || flag.startsWith("--eval=") ||
+      flag === "--print" || flag.startsWith("--print=")
+    );
   }
   return false;
 }
@@ -345,6 +355,13 @@ export class RequestBroker {
             expires_at: expiresAt,
             grant_keys: grantKeys,
           };
+          // Persist the revoke-button mapping BEFORE the notification goes
+          // out, so the button resolves even across a broker restart.
+          try {
+            this.deps.grants.saveRevokeHandle(request.request_id, grantKeys);
+          } catch (error) {
+            this.log(`saving revoke handle failed: ${error instanceof Error ? error.message : String(error)}`);
+          }
           // Fire and forget: a Sighting informs, it never gates delivery.
           void this.deps.approver.notifySighting(card).catch((error) => {
             this.log(`sighting notification failed: ${error instanceof Error ? error.message : String(error)}`);

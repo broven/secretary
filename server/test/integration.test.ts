@@ -85,7 +85,7 @@ async function startStack(options: { approvalTimeoutMs?: number } = {}): Promise
   const telegram = await startFakeTelegram();
   const approver = new TelegramApprover(
     { botToken: "test-bot-token", chatId: "100", allowedUserIds: [OWNER], apiBase: telegram.url },
-    { onRevoke: (keys) => grants.revoke(keys) },
+    { onRevoke: (sightingId) => grants.revokeByHandle(sightingId) },
     { log: () => {} },
   );
   approver.start();
@@ -229,6 +229,43 @@ describe("broker integration (fake telegram + fake vault)", () => {
     await waitForMessages(stack.telegram, 3);
     stack.telegram.pressButton(firstCallback(stack.telegram, 2, ":deny"), OWNER);
     expect((await third).body).toEqual({ approved: false, denied_reason: "denied" });
+  }, 20_000);
+
+  test("the sighting revoke button survives a broker restart (P1-c)", async () => {
+    const stack = await startStack();
+    const keys = await clientKeys();
+    // Approve once, then hit the fast path with a new command to emit a sighting.
+    const first = postRequest(stack, requestBody({}, keys.publicKeyJwk));
+    await waitForMessages(stack.telegram, 1);
+    stack.telegram.pressButton(firstCallback(stack.telegram, 0, ":approve_7d"), OWNER);
+    expect((await first).body.approved).toBe(true);
+    const reused = await postRequest(stack, requestBody(
+      { command_argv: ["another-tool"] },
+      (await clientKeys()).publicKeyJwk,
+    ));
+    expect(reused.body.grant_reused).toBe(true);
+    await waitForMessages(stack.telegram, 2);
+    const revokeData = firstCallback(stack.telegram, 1, "rv:");
+
+    // "Restart" the broker: a fresh approver with EMPTY memory over the same
+    // SQLite — the revoke handle must resolve durably.
+    stack.approver.stop();
+    const approver2 = new TelegramApprover(
+      { botToken: "test-bot-token", chatId: "100", allowedUserIds: [OWNER], apiBase: stack.telegram.url },
+      { onRevoke: (sightingId) => stack.grants.revokeByHandle(sightingId) },
+      { log: () => {} },
+    );
+    approver2.start();
+    cleanups.push(() => approver2.stop());
+    const answeredBefore = stack.telegram.answeredCallbacks.length;
+    stack.telegram.pressButton(revokeData, OWNER);
+    const deadline = Date.now() + 3_000;
+    while (stack.telegram.answeredCallbacks.length <= answeredBefore) {
+      if (Date.now() > deadline) throw new Error("revoke callback was never processed");
+      await Bun.sleep(20);
+    }
+    expect(stack.telegram.answeredCallbacks.at(-1)!.text).toContain("已吊销");
+    expect(stack.telegram.answeredCallbacks.at(-1)!.text).not.toContain("0 行");
   }, 20_000);
 
   test("reject → fail closed, no grant written", async () => {
