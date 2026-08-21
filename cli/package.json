@@ -1,0 +1,8 @@
+{
+  "name": "secretary-cli",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "bun-types": "^1.3.0"
+  }
+}
