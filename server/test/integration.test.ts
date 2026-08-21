@@ -357,6 +357,48 @@ describe("broker integration (fake telegram + fake vault)", () => {
     expect(health.status).toBe(200);
   }, 15_000);
 
+  test("a client disconnect mid-long-poll never crashes the broker", async () => {
+    const stack = await startStack();
+    const keys = await clientKeys();
+    const body = requestBody({}, keys.publicKeyJwk);
+
+    // Start a request, then drop the connection while it is parked.
+    const abort = new AbortController();
+    const doomed = fetch(`${stack.url}/v1/requests`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${stack.token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: abort.signal,
+    }).catch(() => null);
+    await waitForMessages(stack.telegram, 1);
+    abort.abort();
+    await doomed;
+    await Bun.sleep(50);
+
+    // The Owner answers AFTER the client is gone: the decision must still be
+    // processed (grant written per documented semantics) and, critically, the
+    // resolve path must not blow up the process on the dead stream.
+    stack.telegram.pressButton(firstCallback(stack.telegram, 0, ":approve_8h"), OWNER);
+    await Bun.sleep(200);
+
+    // Broker still alive and serving…
+    const health = await fetch(`${stack.url}/healthz`);
+    expect(health.status).toBe(200);
+    // …and the late decision wrote the grant: a fresh request takes the fast path.
+    const keys2 = await clientKeys();
+    const body2 = requestBody({ command_argv: ["post-disconnect-tool"] }, keys2.publicKeyJwk);
+    const second = await postRequest(stack, body2);
+    expect(second.status).toBe(200);
+    expect(second.body.approved).toBe(true);
+    expect(second.body.grant_reused).toBe(true);
+    const credentials = await decryptCredentialEnvelope(
+      second.body.credential_envelope,
+      keys2.privateKey,
+      body2.request_id as string,
+    );
+    expect(credentials).toEqual({ EXAMPLE_TOKEN: "example-secret-value" });
+  }, 15_000);
+
   test("chunked bodies past 256 KiB are rejected while streaming (P2-i)", async () => {
     const stack = await startStack();
     const chunk = new TextEncoder().encode("x".repeat(64 * 1024));

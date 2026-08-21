@@ -13,6 +13,18 @@ import { startHttpServer } from "./http.ts";
 import { RequestBroker } from "./requests.ts";
 import { BwVault } from "./vault.ts";
 
+// Process-level guard: a per-request failure (e.g. a stream controller racing
+// a client disconnect) must NEVER take the broker down — one bad request would
+// drop every in-flight approval. Log loudly and keep serving; genuinely
+// unrecoverable states (vault startup, config) still fail fast because they
+// throw before the server starts.
+process.on("unhandledRejection", (reason) => {
+  console.error(`[secretary] UNHANDLED REJECTION (continuing): ${reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)}`);
+});
+process.on("uncaughtException", (error) => {
+  console.error(`[secretary] UNCAUGHT EXCEPTION (continuing): ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`);
+});
+
 async function main(): Promise<void> {
   const config = loadConfig(process.env);
   const log = (message: string) => console.log(`[secretary] ${message}`);

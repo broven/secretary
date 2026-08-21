@@ -79,18 +79,42 @@ function longPollResponse(
 ): Response {
   const encoder = new TextEncoder();
   let timer: ReturnType<typeof setInterval> | undefined;
+  // Once the client disconnects (cancel) or the stream closes, the controller
+  // must never be touched again: enqueue() on a closed controller throws, and
+  // outside a try it would take the whole process down with it. Every write
+  // and close goes through these guards.
+  let closed = false;
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
-      timer = setInterval(() => {
+      const safeEnqueue = (text: string) => {
+        if (closed) return;
         try {
-          controller.enqueue(encoder.encode("\n"));
+          controller.enqueue(encoder.encode(text));
         } catch {
+          // Controller raced into a closed/errored state; stop writing.
+          closed = true;
           clearInterval(timer);
         }
-      }, HEARTBEAT_INTERVAL_MS);
+      };
+      const safeClose = () => {
+        clearInterval(timer);
+        if (closed) return;
+        closed = true;
+        try {
+          controller.close();
+        } catch {
+          // Already errored/cancelled.
+        }
+      };
+      timer = setInterval(() => safeEnqueue("\n"), HEARTBEAT_INTERVAL_MS);
+      // NOTE on disconnects: the parked approval is deliberately NOT cancelled
+      // when the client goes away — the Owner may already be reading the card,
+      // and their decision still applies to the Grant store exactly as if the
+      // client had waited. Only the response delivery is dropped; the client
+      // has already failed closed on its side (no envelope ever reached it).
       pending
         .then((result) => {
-          controller.enqueue(encoder.encode(JSON.stringify(result)));
+          safeEnqueue(JSON.stringify(result));
         })
         .catch((error) => {
           // Status is already committed; deliver the error in-band. The client
@@ -99,19 +123,15 @@ function longPollResponse(
             ? error.message
             : (log(`request failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`),
               "internal error");
-          controller.enqueue(encoder.encode(JSON.stringify({ error: message })));
+          safeEnqueue(JSON.stringify({ error: message }));
         })
-        .finally(() => {
-          clearInterval(timer);
-          try {
-            controller.close();
-          } catch {
-            // Already errored/cancelled.
-          }
-        });
+        .finally(safeClose);
     },
     cancel() {
+      // Client disconnected mid-poll.
+      closed = true;
       clearInterval(timer);
+      log("long-poll client disconnected before the decision; response dropped (request continues)");
     },
   });
   return new Response(stream, {
