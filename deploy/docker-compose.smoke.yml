@@ -1,0 +1,13 @@
+# Overlay for the local end-to-end smoke test (deploy/smoke.ts). Never use in
+# production: it publishes vaultwarden on localhost and enables the dev
+# auto-approver so no Telegram bot is needed.
+services:
+  broker:
+    environment:
+      SECRETARY_DEV_AUTO_APPROVE: "1"
+      NODE_ENV: development
+  vaultwarden:
+    ports:
+      - "127.0.0.1:18222:80"
+    environment:
+      SIGNUPS_ALLOWED: "true"

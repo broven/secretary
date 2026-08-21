@@ -1,0 +1,69 @@
+services:
+  broker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    platform: linux/amd64 # bw CLI ships x64-only
+    ports:
+      - "8787:8787"
+    restart: unless-stopped
+    volumes:
+      - broker-data:/data
+    environment:
+      # Compose-internal vaultwarden (--profile vaultwarden). To use another
+      # vault, set e.g. VAULT_URL=https://vault.bitwarden.com or your own
+      # https://vaultwarden.example.com.
+      VAULT_URL: ${VAULT_URL:-http://vaultwarden}
+      BW_EMAIL: ${BW_EMAIL}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+      TELEGRAM_ALLOWED_USER_IDS: ${TELEGRAM_ALLOWED_USER_IDS}
+      # Secrets come from docker secrets via _FILE variants (default).
+      BW_CLIENTID_FILE: /run/secrets/bw_clientid
+      BW_CLIENTSECRET_FILE: /run/secrets/bw_clientsecret
+      BW_PASSWORD_FILE: /run/secrets/bw_password
+      TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram_bot_token
+      # Plain-env alternative: remove the _FILE lines above (setting both is
+      # a config error) and the secrets blocks, then uncomment:
+      # BW_CLIENTID: ${BW_CLIENTID}
+      # BW_CLIENTSECRET: ${BW_CLIENTSECRET}
+      # BW_PASSWORD: ${BW_PASSWORD}
+      # TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+    secrets:
+      - bw_clientid
+      - bw_clientsecret
+      - bw_password
+      - telegram_bot_token
+    healthcheck:
+      # The image has no curl/wget; probe with bun itself.
+      test: ["CMD", "bun", "-e", "await fetch('http://127.0.0.1:8787/healthz').then(r=>{if(!r.ok)throw 0})"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+  vaultwarden:
+    image: vaultwarden/server:latest
+    profiles: ["vaultwarden"]
+    restart: unless-stopped
+    volumes:
+      - vw-data:/data
+    environment:
+      # Needed once to create the automation account; set to "false" afterwards.
+      SIGNUPS_ALLOWED: ${SIGNUPS_ALLOWED:-true}
+    # Publish temporarily for initial account setup via browser, then remove.
+    # ports:
+    #   - "8222:80"
+
+secrets:
+  bw_clientid:
+    file: ./secrets/bw_clientid
+  bw_clientsecret:
+    file: ./secrets/bw_clientsecret
+  bw_password:
+    file: ./secrets/bw_password
+  telegram_bot_token:
+    file: ./secrets/telegram_bot_token
+
+volumes:
+  broker-data:
+  vw-data:
