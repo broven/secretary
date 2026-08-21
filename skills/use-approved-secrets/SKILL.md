@@ -15,8 +15,16 @@ run:
 curl -fsSL https://raw.githubusercontent.com/broven/secretary/main/install.sh | sh
 ```
 
-Then they point it at their broker themselves — `auth set-url`, `auth
-set-client-id`, `auth import`. Never ask for, accept, or echo the token.
+If you are running it for them, add `SECRETARY_YES=1` — you have no terminal to
+answer its prompts:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/broven/secretary/main/install.sh | SECRETARY_YES=1 sh
+```
+
+Then the user points it at their broker: `auth set-url <their broker URL>` and
+`auth import` (the token comes from `client add` on the broker host). Those two
+steps are theirs — never ask for, accept, or echo the token.
 
 
 Credentials live in a Bitwarden/Vaultwarden vault. The `approved-secret` command talks

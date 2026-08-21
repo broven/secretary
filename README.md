@@ -109,6 +109,16 @@ and it can always be done separately:
 npx skills add broven/secretary
 ```
 
+**Setting this up for someone else** — a code agent following this README, or
+any unattended run — has no terminal to answer the prompts. Ask for nothing:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/broven/secretary/main/install.sh | SECRETARY_YES=1 sh
+```
+
+That installs the skill for every detected agent, user-wide;
+`SECRETARY_SKILL_SCOPE=project` keeps it to the current directory instead.
+
 Prefer to read the installer before running it — it is a shell script from the
 internet:
 
