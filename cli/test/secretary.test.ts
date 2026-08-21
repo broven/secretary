@@ -595,6 +595,30 @@ describe("review fixes", () => {
     expect(long.length).toBeLessThanOrEqual(200);
   });
 
+  test("P1-iv: relative/local remotes resolve against cwd; URL remotes keep the port", () => {
+    // Relative path remotes must not collide across unrelated checkouts.
+    expect(normalizeRepoIdentity("../remote.git", "/work/a/checkout"))
+      .toBe("local:/work/a/remote");
+    expect(normalizeRepoIdentity("../remote.git", "/tmp/other/checkout"))
+      .toBe("local:/tmp/other/remote");
+    expect(normalizeRepoIdentity("./remote.git", "/work/a/checkout"))
+      .toBe("local:/work/a/checkout/remote");
+    // Absolute path remotes are canonical already.
+    expect(normalizeRepoIdentity("/srv/git/repo.git", "/anywhere"))
+      .toBe("local:/srv/git/repo");
+    // file:// remotes are local paths in disguise.
+    expect(normalizeRepoIdentity("file:///srv/git/repo.git", "/anywhere"))
+      .toBe("local:/srv/git/repo");
+    // Non-default ports survive: host:8443/x and host/x are different remotes.
+    expect(normalizeRepoIdentity("https://git.example.com:8443/owner/repo.git", "/x"))
+      .toBe("git.example.com:8443/owner/repo");
+    expect(normalizeRepoIdentity("https://git.example.com/owner/repo.git", "/x"))
+      .toBe("git.example.com/owner/repo");
+    // scp-style stays as before.
+    expect(normalizeRepoIdentity("git@github.com:owner/repo.git", "/x"))
+      .toBe("github.com/owner/repo");
+  });
+
   test("P2-1: custom field names parse as bindings and reach the wire", async () => {
     expect(parseInvocation([
       "--cwd", "/repo", "exec", "--reason", "给 CI 补一个 release tag",

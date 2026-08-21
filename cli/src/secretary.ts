@@ -7,7 +7,7 @@
 
 import { realpath, stat } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { basename } from "node:path";
+import { basename, resolve as resolvePath } from "node:path";
 import { hostname, userInfo } from "node:os";
 
 // Keychain locations for the three config settings. Env vars always win.
@@ -435,9 +435,32 @@ async function resolveConfig(deps: ClientDeps): Promise<BrokerConfig> {
 async function readTextLimited(response: Response): Promise<string> {
   const declared = Number(response.headers.get("content-length") || 0);
   if (declared > MAX_RESPONSE_BYTES) throw new Error("secretary 响应超过安全限制");
-  const text = await response.text();
-  if (text.length > MAX_RESPONSE_BYTES) throw new Error("secretary 响应超过安全限制");
-  return text;
+  if (!response.body) return "";
+  // Enforce the cap while streaming: never buffer an oversized body first.
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_RESPONSE_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        throw new Error("secretary 响应超过安全限制");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
 }
 
 function timeoutError(): Error {
@@ -511,24 +534,38 @@ async function brokerJson(
 
 // ---------------------------------------------------------------------------
 
+/** Collision-resistant identity for a local path (no remote, or a path remote). */
+function localRepoIdentity(path: string): string {
+  const local = `local:${path}`;
+  return local.length <= 200 ? local : `local:sha256:${createHash("sha256").update(path).digest("hex")}`;
+}
+
 export function normalizeRepoIdentity(remote: string | undefined, cwd: string): string {
   const value = remote?.trim().replace(/\/+$/, "").replace(/\.git$/, "");
-  if (!value) {
-    // No origin remote: derive a collision-resistant identity from the
-    // canonical absolute path — two unrelated directories that share a
-    // basename must not share Grant keys.
-    const local = `local:${cwd}`;
-    return local.length <= 200 ? local : `local:sha256:${createHash("sha256").update(cwd).digest("hex")}`;
+  // No origin remote: two unrelated directories sharing a basename must not
+  // share Grant keys, so the canonical absolute path is the identity.
+  if (!value) return localRepoIdentity(cwd);
+  if (value.includes("://")) {
+    try {
+      const url = new URL(value);
+      // file:// remotes are local paths in disguise.
+      if (url.protocol === "file:") return localRepoIdentity(decodeURIComponent(url.pathname) || cwd);
+      const path = url.pathname.replace(/^\/+/, "");
+      // url.host (not hostname) keeps a non-default port: host:8443/x and
+      // host/x are different remotes.
+      return path ? `${url.host}/${path}` : url.host;
+    } catch {
+      return localRepoIdentity(resolvePath(cwd, value));
+    }
   }
-  const scp = value.includes("://") ? null : value.match(/^([^@]+@)?([^:]+):(.+)$/);
+  // Local-path remotes — relative (../remote.git) or absolute — resolve
+  // against the caller's cwd so unrelated checkouts never share an identity.
+  if (value.startsWith("/") || value.startsWith(".") || !value.includes(":")) {
+    return localRepoIdentity(resolvePath(cwd, value));
+  }
+  const scp = value.match(/^([^@]+@)?([^:]+):(.+)$/);
   if (scp) return `${scp[2]}/${scp[3]}`;
-  try {
-    const url = new URL(value);
-    const path = url.pathname.replace(/^\/+/, "");
-    return path ? `${url.hostname}/${path}` : url.hostname;
-  } catch {
-    return value.slice(0, 200);
-  }
+  return localRepoIdentity(resolvePath(cwd, value));
 }
 
 export function commandEnvironment(
