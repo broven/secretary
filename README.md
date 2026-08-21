@@ -99,11 +99,12 @@ checksum-verified, no bun or compiler needed:
 curl -fsSL https://raw.githubusercontent.com/broven/secretary/main/install.sh | sh
 ```
 
-The second installs the agent-facing skill, and asks which of your code agents
-should get it:
+The second installs the agent-facing skill. It detects the code agents on the
+machine and sets them all up — add `-g` for a user-wide install instead of the
+current project:
 
 ```sh
-npx skills add broven/secretary --skill use-approved-secrets
+npx skills add broven/secretary
 ```
 
 Prefer to read the installer before running it — it is a shell script from the
