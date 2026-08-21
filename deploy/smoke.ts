@@ -203,21 +203,27 @@ async function main() {
     log(`  total wall clock:             ${Date.now() - started} ms`);
   } finally {
     if (process.env.SMOKE_KEEP === "1") {
+      // No `return` here: returning from a finally block would swallow a
+      // pending test failure. Just skip the cleanup.
       log("SMOKE_KEEP=1 — leaving the compose stack and secret files in place for debugging");
-      return;
+    } else {
+      await cleanup(composeUp, scratch);
     }
-    if (composeUp) {
-      log("tearing down compose project");
-      await run([...COMPOSE, "down", "-v"], {
-        env: { BW_EMAIL: EMAIL, TELEGRAM_CHAT_ID: "0", TELEGRAM_ALLOWED_USER_IDS: "1" },
-      });
-    }
-    for (const name of ["bw_clientid", "bw_clientsecret", "bw_password", "telegram_bot_token"]) {
-      rmSync(join(DEPLOY, "secrets", name), { force: true });
-    }
-    rmSync(TLS_DIR, { recursive: true, force: true });
-    rmSync(scratch, { recursive: true, force: true });
   }
+}
+
+async function cleanup(composeUp: boolean, scratch: string): Promise<void> {
+  if (composeUp) {
+    log("tearing down compose project");
+    await run([...COMPOSE, "down", "-v"], {
+      env: { BW_EMAIL: EMAIL, TELEGRAM_CHAT_ID: "0", TELEGRAM_ALLOWED_USER_IDS: "1" },
+    });
+  }
+  for (const name of ["bw_clientid", "bw_clientsecret", "bw_password", "telegram_bot_token"]) {
+    rmSync(join(DEPLOY, "secrets", name), { force: true });
+  }
+  rmSync(TLS_DIR, { recursive: true, force: true });
+  rmSync(scratch, { recursive: true, force: true });
 }
 
 await main();
