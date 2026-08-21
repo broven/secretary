@@ -59,7 +59,11 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 825 \
   -keyout deploy/vw-tls/key.pem -out deploy/vw-tls/cert.pem \
   -subj "/CN=vaultwarden" \
   -addext "subjectAltName=DNS:vaultwarden,DNS:localhost,IP:127.0.0.1"
-chmod 644 deploy/vw-tls/key.pem deploy/vw-tls/cert.pem
+# The private key must not be world-readable. The vaultwarden container runs
+# as root by default, so root-owned 0600 works through the read-only bind
+# mount; the cert stays world-readable for the broker and your tooling.
+chmod 600 deploy/vw-tls/key.pem
+chmod 644 deploy/vw-tls/cert.pem
 ```
 
 Then in `docker-compose.yml` uncomment `ROCKET_TLS` and `ROCKET_PORT: "443"`
@@ -102,6 +106,13 @@ docker compose up -d --build
 docker compose --profile vaultwarden up -d --build
 docker compose logs -f broker
 ```
+
+The broker binds `127.0.0.1:8787` by default: it speaks plain HTTP, and the
+bearer tokens must never cross an untrusted network in the clear. To let agent
+machines reach it, put your TLS ingress or tunnel (Caddy, Traefik,
+cloudflared, Tailscale, …) in front of the loopback port; only switch the
+compose mapping to `0.0.0.0:8787:8787` if you consciously terminate TLS
+elsewhere on the same host boundary.
 
 ## 5. Issue a client token
 

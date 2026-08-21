@@ -4,7 +4,12 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
     ports:
-      - "8787:8787"
+      # Loopback-only by default: the broker speaks plain HTTP and bearer
+      # tokens must not cross untrusted networks in the clear. Front it with
+      # your TLS ingress / tunnel (Caddy, Traefik, cloudflared, …) and only
+      # widen the bind consciously:
+      # - "0.0.0.0:8787:8787"
+      - "127.0.0.1:8787:8787"
     restart: unless-stopped
     volumes:
       - broker-data:/data

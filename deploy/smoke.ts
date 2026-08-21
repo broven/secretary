@@ -91,8 +91,10 @@ async function generateSmokeTls() {
   ], { stdin: "ignore", stdout: "ignore", stderr: "pipe" });
   const [stderr, exitCode] = await Promise.all([new Response(child.stderr).text(), child.exited]);
   if (exitCode !== 0) throw new Error(`openssl failed: ${stderr}`);
-  // Key must be readable by the vaultwarden container user.
-  await run(["chmod", "644", join(TLS_DIR, "key.pem"), CA_FILE]);
+  // Key stays 0600 (the vaultwarden container reads it as root); only the
+  // cert is world-readable.
+  await run(["chmod", "600", join(TLS_DIR, "key.pem")]);
+  await run(["chmod", "644", CA_FILE]);
 }
 
 async function main() {
