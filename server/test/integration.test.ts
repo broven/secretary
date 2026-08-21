@@ -70,8 +70,8 @@ async function startStack(options: { approvalTimeoutMs?: number } = {}): Promise
       revision: "2030-01-01T00:00:00.000Z",
       name: "Example API",
       description: "test item",
-      fields: ["username", "password"],
-      values: { username: "svc-user", password: "example-secret-value" },
+      fields: ["username", "password", "api_key"],
+      values: { username: "svc-user", password: "example-secret-value", api_key: "custom-field-value" },
     },
     {
       item_id: "11111111-aaaa-bbbb-cccc-000000000002",
@@ -334,6 +334,70 @@ describe("broker integration (fake telegram + fake vault)", () => {
     const [a, b] = await Promise.all([first, second]);
     expect(a.body.approved).toBe(true);
     expect(b.body.approved).toBe(true);
+  }, 15_000);
+
+  test("custom fields flow end to end (P2-1)", async () => {
+    const stack = await startStack();
+    const keys = await clientKeys();
+    const body = requestBody({
+      items: [{
+        name: "Example API",
+        bindings: [
+          { field: "password", env: "EXAMPLE_TOKEN" },
+          { field: "api_key", env: "EXAMPLE_API_KEY" },
+        ],
+      }],
+    }, keys.publicKeyJwk);
+    const pending = postRequest(stack, body);
+    await waitForMessages(stack.telegram, 1);
+    stack.telegram.pressButton(firstCallback(stack.telegram, 0, ":approve_1h"), OWNER);
+    const { body: result } = await pending;
+    expect(result.approved).toBe(true);
+    const credentials = await decryptCredentialEnvelope(
+      result.credential_envelope,
+      keys.privateKey,
+      body.request_id as string,
+    );
+    expect(credentials).toEqual({
+      EXAMPLE_TOKEN: "example-secret-value",
+      EXAMPLE_API_KEY: "custom-field-value",
+    });
+    // A field the item does not offer is rejected before approval.
+    const bad = await postRequest(stack, requestBody({
+      items: [{ name: "Other API", bindings: [{ field: "nope", env: "X_TOKEN" }] }],
+    }, (await clientKeys()).publicKeyJwk));
+    expect(bad.body.error).toContain("nope");
+  }, 15_000);
+
+  test("credential payloads past the client decrypt cap fail closed server-side (P2-8)", async () => {
+    const db = new Database(":memory:");
+    const grants = new GrantStore(db);
+    const clients = new ClientRegistry(db);
+    const { token } = clients.add("big-agent");
+    // 10 items × 2 fields × 65,536-byte values ≈ 1.31 MB serialized — past the cap.
+    const bigItems = Array.from({ length: 10 }, (_, index) => ({
+      item_id: `11111111-aaaa-bbbb-cccc-9000000000${String(index).padStart(2, "0")}`,
+      revision: "r",
+      name: `Big ${index}`,
+      description: "",
+      fields: ["username", "password"],
+      values: { username: "u".repeat(65_536), password: "p".repeat(65_536) },
+    }));
+    const vault = new FakeVault(bigItems);
+    const approver = createAutoApprover({ env: { SECRETARY_DEV_AUTO_APPROVE: "1" }, log: () => {} });
+    const broker = new RequestBroker({ vault, grants, approver, approvalTimeoutMs: 2_000, log: () => {} });
+    const keys = await clientKeys();
+    const body = requestBody({
+      items: bigItems.map((item, index) => ({
+        name: item.name,
+        bindings: [
+          { field: "username", env: `BIG_USER_${index}` },
+          { field: "password", env: `BIG_PASS_${index}` },
+        ],
+      })),
+    }, keys.publicKeyJwk);
+    expect(broker.handle(body, { client_id: "c-big", name: "big-agent" }))
+      .rejects.toThrow("credential payload too large");
   }, 15_000);
 
   test("dev auto-approver approves without telegram (gated)", async () => {

@@ -310,22 +310,37 @@ export class TelegramApprover implements Approver {
   }
 
   async requestApproval(card: ApprovalCard, timeoutMs: number): Promise<ApprovalDecision> {
-    // sendMessage failures propagate: the caller treats an undeliverable card
-    // as a failed request (fail closed), not a silent deny.
-    await this.api("sendMessage", {
-      chat_id: this.chatId,
-      text: buildApprovalText(card),
-      parse_mode: "HTML",
-      disable_web_page_preview: true,
-      reply_markup: buildApprovalKeyboard(card),
-    });
-    return new Promise<ApprovalDecision>((resolve) => {
+    // Park the request and arm the deadline BEFORE sending: a stalled
+    // sendMessage must never extend the approval window, and the send itself
+    // is bounded so it cannot park the request forever.
+    let entry: PendingApproval;
+    const decision = new Promise<ApprovalDecision>((resolve) => {
       const timer = setTimeout(() => {
         this.pending.delete(card.id);
         resolve({ approved: false, reason: "timeout" });
       }, timeoutMs);
-      this.pending.set(card.id, { resolve, timer, inlineShell: card.inline_shell });
+      entry = { resolve, timer, inlineShell: card.inline_shell };
+      this.pending.set(card.id, entry);
     });
+    try {
+      await this.api("sendMessage", {
+        chat_id: this.chatId,
+        text: buildApprovalText(card),
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+        reply_markup: buildApprovalKeyboard(card),
+      }, AbortSignal.timeout(Math.min(timeoutMs, 30_000)));
+    } catch (error) {
+      // sendMessage failures propagate: the caller treats an undeliverable card
+      // as a failed request (fail closed), not a silent deny — unless a
+      // decision somehow already landed.
+      if (this.pending.get(card.id) === entry!) {
+        clearTimeout(entry!.timer);
+        this.pending.delete(card.id);
+        throw error;
+      }
+    }
+    return decision;
   }
 
   async notifySighting(card: SightingCard): Promise<void> {

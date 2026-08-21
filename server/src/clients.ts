@@ -22,12 +22,17 @@ export class ClientRegistry {
     this.db.run(`
       CREATE TABLE IF NOT EXISTS clients (
         client_id TEXT PRIMARY KEY,
-        name TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL,
         token_hash TEXT NOT NULL UNIQUE,
         created_at INTEGER NOT NULL,
         revoked_at INTEGER
       )
     `);
+    // Names are unique among ACTIVE clients only, so a revoked name can be
+    // re-issued (revoked rows stay for the audit trail).
+    this.db.run(
+      "CREATE UNIQUE INDEX IF NOT EXISTS clients_active_name ON clients(name) WHERE revoked_at IS NULL",
+    );
   }
 
   /** Returns the plaintext token — the only moment it ever exists outside the caller. */

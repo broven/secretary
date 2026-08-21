@@ -33,6 +33,19 @@ describe("client registry", () => {
     expect(registry.revoke("laptop")).toBe(false);
   });
 
+  test("a revoked name can be re-issued as a fresh client (P2-6)", () => {
+    const db = new Database(":memory:");
+    const registry = new ClientRegistry(db);
+    const first = registry.add("laptop");
+    registry.revoke("laptop");
+    const second = registry.add("laptop");
+    expect(second.client_id).not.toBe(first.client_id);
+    expect(registry.authenticate(second.token)).toEqual({ client_id: second.client_id, name: "laptop" });
+    expect(registry.authenticate(first.token)).toBeNull();
+    // Both rows remain for the audit trail.
+    expect(registry.list().filter((row) => row.name === "laptop")).toHaveLength(2);
+  });
+
   test("rejects invalid names", () => {
     const registry = new ClientRegistry(new Database(":memory:"));
     expect(() => registry.add("bad name!")).toThrow("invalid");

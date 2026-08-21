@@ -22,6 +22,7 @@ import {
   type SecretGrantTtl,
   secretGrantTtlHours,
 } from "./types.ts";
+import { isValidFieldName } from "./vault.ts";
 
 export const SECRET_GRANT_TABLE = "secret_grants";
 export const SECRET_SIGHTING_TABLE = "secret_command_sightings";
@@ -80,7 +81,8 @@ export function assertSecretItemId(value: string): string {
 }
 
 function assertSecretField(value: string): SecretField {
-  if (value !== "username" && value !== "password") throw new Error("invalid grant field");
+  // "username", "password", or a custom field name (see vault.ts FIELD_NAME).
+  if (!isValidFieldName(value)) throw new Error("invalid grant field");
   return value;
 }
 
@@ -125,30 +127,35 @@ export function commandFingerprint(argv: string[]): string {
 }
 
 /**
- * Sighting key = identity + command fingerprint + item set.
+ * Sighting key = identity + command fingerprint + authorization-unit set.
  *
- * The item set is included to catch "this command got this key for the first
- * time" — the same command picking up a higher-privilege key is a new fact
+ * The unit set (grant keys — item AND field) is included to catch "this
+ * command got this key for the first time" — the same command picking up a
+ * higher-privilege key, or a different field of the same item, is a new fact
  * worth knowing; mere repetition is not.
  */
 export function commandSightingKey(
   identity: SecretGrantIdentity,
   commandHash: string,
-  itemIds: string[],
+  unitKeys: string[],
 ): string {
   const scope = normalizeIdentity(identity);
   if (typeof commandHash !== "string" || !/^[a-f0-9]{64}$/.test(commandHash)) {
     throw new Error("invalid command_hash");
   }
-  const items = [...new Set((itemIds || []).map(assertSecretItemId))].sort();
-  if (items.length === 0 || items.length > 10) throw new Error("invalid sighting item count");
+  const units = [...new Set((unitKeys || []).map((key) => {
+    const unit = String(key || "").trim();
+    if (!/^[A-Za-z0-9_-]{8,128}$/.test(unit)) throw new Error("invalid sighting unit key");
+    return unit;
+  }))].sort();
+  if (units.length === 0 || units.length > 40) throw new Error("invalid sighting unit count");
   return createHash("sha256").update(JSON.stringify({
     v: 1,
     caller_id: scope.caller_id,
     client_id: scope.client_id,
     repo: scope.repo,
     command_hash: commandHash,
-    items,
+    items: units,
   })).digest("hex");
 }
 
@@ -342,10 +349,10 @@ export class GrantStore {
   recordSighting(
     identity: SecretGrantIdentity,
     commandHash: string,
-    itemIds: string[],
+    unitKeys: string[],
   ): { key: string; seen_before: boolean } {
     const scope = normalizeIdentity(identity);
-    const key = commandSightingKey(scope, commandHash, itemIds);
+    const key = commandSightingKey(scope, commandHash, unitKeys);
     const existing = this.db.query<{ sighting_key: string }, [string]>(
       `SELECT sighting_key FROM ${SECRET_SIGHTING_TABLE} WHERE sighting_key = ?`,
     ).get(key);

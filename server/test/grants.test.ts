@@ -205,9 +205,18 @@ describe("key functions", () => {
     expect(() => secretGrantKey(identity, { item_id: "short", field: "password" })).toThrow(
       "invalid grant item_id",
     );
-    expect(() => secretGrantKey(identity, { item_id: unitA.item_id, field: "totp" as never })).toThrow(
+    // Custom field names are legal grant fields now; only names that would
+    // break the binding syntax (or control chars) are rejected.
+    expect(() => secretGrantKey(identity, { item_id: unitA.item_id, field: "totp" })).not.toThrow();
+    expect(() => secretGrantKey(identity, { item_id: unitA.item_id, field: "a=b" })).toThrow(
       "invalid grant field",
     );
+    expect(() => secretGrantKey(identity, { item_id: unitA.item_id, field: "a,b" })).toThrow(
+      "invalid grant field",
+    );
+    // Different fields of the same item produce different grant keys.
+    expect(secretGrantKey(identity, { item_id: unitA.item_id, field: "api_key" }))
+      .not.toBe(secretGrantKey(identity, { item_id: unitA.item_id, field: "password" }));
   });
 
   test("assertSecretGrantKey accepts 64-hex and rejects the rest", () => {
@@ -224,15 +233,21 @@ describe("key functions", () => {
     expect(() => commandFingerprint([])).toThrow();
   });
 
-  test("commandSightingKey sorts and dedupes item ids, caps at 10", () => {
+  test("commandSightingKey sorts and dedupes unit keys, caps at 40", () => {
     const hash = commandFingerprint(["ls"]);
     const k1 = commandSightingKey(identity, hash, [unitB.item_id, unitA.item_id]);
     const k2 = commandSightingKey(identity, hash, [unitA.item_id, unitB.item_id, unitA.item_id]);
     expect(k1).toBe(k2);
     expect(() => commandSightingKey(identity, hash, [])).toThrow();
-    const many = Array.from({ length: 11 }, (_, i) => `item-many-${String(i).padStart(4, "0")}`);
+    const many = Array.from({ length: 41 }, (_, i) => `unit-many-${String(i).padStart(4, "0")}`);
     expect(() => commandSightingKey(identity, hash, many)).toThrow();
     expect(() => commandSightingKey(identity, "nothex", [unitA.item_id])).toThrow("invalid command_hash");
+    // Grant keys (which encode item AND field) are the intended unit keys:
+    // the same command with a different field of the same item is a NEW sighting.
+    const passwordKey = secretGrantKey(identity, { item_id: unitA.item_id, field: "password" });
+    const usernameKey = secretGrantKey(identity, { item_id: unitA.item_id, field: "username" });
+    expect(commandSightingKey(identity, hash, [passwordKey]))
+      .not.toBe(commandSightingKey(identity, hash, [usernameKey]));
   });
 });
 

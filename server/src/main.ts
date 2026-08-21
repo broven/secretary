@@ -64,6 +64,7 @@ async function main(): Promise<void> {
     vault,
     hostname: config.listen_addr.hostname,
     port: config.listen_addr.port,
+    approvalTimeoutMs: config.approval_timeout_s * 1000,
     log,
   });
 

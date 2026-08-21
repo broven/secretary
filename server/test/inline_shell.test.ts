@@ -24,6 +24,26 @@ describe("inline shell detection (ported table)", () => {
     expect(isInlineShellCommand(["env", "A=1"])).toBe(false);
   });
 
+  test("env option evasion forms stay inline (P1-1)", () => {
+    expect(isInlineShellCommand(["env", "--", "sh", "-c", "x"])).toBe(true);
+    expect(isInlineShellCommand(["env", "-i", "sh", "-c", "x"])).toBe(true);
+    expect(isInlineShellCommand(["env", "--ignore-environment", "sh", "-c", "x"])).toBe(true);
+    expect(isInlineShellCommand(["env", "-u", "FOO", "sh", "-c", "x"])).toBe(true);
+    expect(isInlineShellCommand(["env", "--unset=FOO", "sh", "-c", "x"])).toBe(true);
+    expect(isInlineShellCommand(["env", "-C", "/tmp", "sh", "-c", "x"])).toBe(true);
+    expect(isInlineShellCommand(["env", "--chdir=/tmp", "sh", "-c", "x"])).toBe(true);
+    expect(isInlineShellCommand(["env", "-i", "A=1", "--", "bash", "-lc", "x"])).toBe(true);
+    // Unrecognized env options are unauditable → conservatively inline.
+    expect(isInlineShellCommand(["env", "-S", "sh -c x"])).toBe(true);
+    expect(isInlineShellCommand(["env", "--split-string=sh -c x"])).toBe(true);
+    // Recognized options wrapping a plain command stay non-inline.
+    expect(isInlineShellCommand(["env", "-i", "tool", "--flag"])).toBe(false);
+    expect(isInlineShellCommand(["env", "-u", "FOO", "git", "push"])).toBe(false);
+    // env with options but no command is not a command at all.
+    expect(isInlineShellCommand(["env", "-i"])).toBe(false);
+    expect(isInlineShellCommand(["env", "-u"])).toBe(false);
+  });
+
   test("plain commands are not inline", () => {
     expect(isInlineShellCommand(["curl", "-c", "cookies.txt", "https://x"])).toBe(false);
     expect(isInlineShellCommand(["python3", "script.py"])).toBe(false);

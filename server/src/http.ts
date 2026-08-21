@@ -12,8 +12,13 @@ export type HttpDeps = {
   vault: Vault;
   hostname: string;
   port: number;
+  /** Effective approval timeout, advertised to clients so their HTTP deadline
+   * can always exceed the server-side parking window. */
+  approvalTimeoutMs?: number;
   log?: (message: string) => void;
 };
+
+export const APPROVAL_TIMEOUT_HEADER = "X-Secretary-Approval-Timeout";
 
 const MAX_BODY_BYTES = 256 * 1024;
 /** Long-poll heartbeat: harmless leading whitespace before the JSON body keeps
@@ -38,7 +43,11 @@ function bearerToken(request: Request): string | null {
  * result. JSON.parse tolerates leading whitespace, so clients just
  * text().trim() — but the connection never looks idle.
  */
-function longPollResponse(pending: Promise<unknown>, log: (message: string) => void): Response {
+function longPollResponse(
+  pending: Promise<unknown>,
+  log: (message: string) => void,
+  extraHeaders: Record<string, string> = {},
+): Response {
   const encoder = new TextEncoder();
   let timer: ReturnType<typeof setInterval> | undefined;
   const stream = new ReadableStream<Uint8Array>({
@@ -76,7 +85,10 @@ function longPollResponse(pending: Promise<unknown>, log: (message: string) => v
       clearInterval(timer);
     },
   });
-  return new Response(stream, { status: 200, headers: { "Content-Type": "application/json" } });
+  return new Response(stream, {
+    status: 200,
+    headers: { "Content-Type": "application/json", ...extraHeaders },
+  });
 }
 
 export function startHttpServer(deps: HttpDeps) {
@@ -129,7 +141,9 @@ export function startHttpServer(deps: HttpDeps) {
         }
         // Disable the per-connection idle timeout for the approval long poll.
         srv.timeout(request, 0);
-        return longPollResponse(pending, log);
+        return longPollResponse(pending, log, deps.approvalTimeoutMs
+          ? { [APPROVAL_TIMEOUT_HEADER]: String(Math.ceil(deps.approvalTimeoutMs / 1000)) }
+          : {});
       }
 
       return json(404, { error: "not found" });

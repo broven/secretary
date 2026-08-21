@@ -26,7 +26,17 @@ import {
   UUID,
   type ApprovalTtl,
 } from "./types.ts";
-import { valueKey, type ResolvedItem, type Vault } from "./vault.ts";
+import { isValidFieldName, valueKey, type ResolvedItem, type Vault } from "./vault.ts";
+
+export const MAX_BINDINGS_PER_ITEM = 10;
+/** Aligned with the grant store's 20-unit cap per save. */
+export const MAX_UNITS_PER_REQUEST = 20;
+/**
+ * Ceiling for the serialized credential payload before envelope encryption.
+ * The CLI refuses ciphertexts over 1 MiB; 1,000,000 plaintext bytes plus the
+ * 16-byte GCM tag always fits under that.
+ */
+export const MAX_CREDENTIAL_PLAINTEXT_BYTES = 1_000_000;
 
 export class RequestError extends Error {
   constructor(message: string, readonly status = 400) {
@@ -52,10 +62,33 @@ const INLINE_INTERPRETERS = new Set(["python", "python3", "perl", "ruby", "node"
 export function isInlineShellCommand(argv: string[]): boolean {
   if (!Array.isArray(argv) || argv.length === 0) return false;
   let parts = argv;
-  // `env` is the most common transparent wrapper: strip it plus VAR=VAL prefixes.
+  // `env` is the most common transparent wrapper: strip it plus VAR=VAL
+  // assignments and the env options we understand. Anything we cannot fully
+  // parse (notably -S, which re-splits its argument into new words) is treated
+  // as inline shell — fail closed on classification uncertainty rather than
+  // let an evasion form create or reuse Grants.
   while (parts.length > 1 && (parts[0].split("/").pop() || "") === "env") {
     let index = 1;
-    while (index < parts.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(parts[index])) index++;
+    let optionsDone = false;
+    while (index < parts.length && !optionsDone) {
+      const part = parts[index];
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(part)) {
+        index++;
+      } else if (part === "--") {
+        index++;
+        optionsDone = true;
+      } else if (part === "-i" || part === "--ignore-environment" || part === "-0" || part === "--null") {
+        index++;
+      } else if (part === "-u" || part === "-C") {
+        index += 2; // option + its argument
+      } else if (part.startsWith("--unset=") || part.startsWith("--chdir=")) {
+        index++;
+      } else if (part.startsWith("-")) {
+        return true; // unknown env option (e.g. -S): unauditable, always approve
+      } else {
+        break; // first non-option word is the wrapped command
+      }
+    }
     if (index >= parts.length) return false;
     parts = parts.slice(index);
   }
@@ -111,20 +144,21 @@ export function parseItems(value: unknown): WireItemRequest[] {
   }
   const seenNames = new Set<string>();
   const seenEnvs = new Set<string>();
-  return value.map((raw) => {
+  const parsed = value.map((raw) => {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new RequestError("item invalid");
     const item = raw as Record<string, unknown>;
     const name = assertShortText(item.name, "item name", 200, true);
     if (seenNames.has(name)) throw new RequestError(`duplicate item: ${name}`);
     seenNames.add(name);
-    if (!Array.isArray(item.bindings) || item.bindings.length === 0 || item.bindings.length > 2) {
+    if (!Array.isArray(item.bindings) || item.bindings.length === 0 || item.bindings.length > MAX_BINDINGS_PER_ITEM) {
       throw new RequestError("item bindings invalid");
     }
     const seenFields = new Set<string>();
     const bindings: WireBinding[] = item.bindings.map((rawBinding) => {
       if (!rawBinding || typeof rawBinding !== "object") throw new RequestError("binding invalid");
       const binding = rawBinding as Record<string, unknown>;
-      if (binding.field !== "username" && binding.field !== "password") {
+      // "username", "password", or a custom field name of the login item.
+      if (!isValidFieldName(binding.field)) {
         throw new RequestError("binding field invalid");
       }
       if (typeof binding.env !== "string" || binding.env.length > 128 || !ENV_NAME.test(binding.env)) {
@@ -142,6 +176,13 @@ export function parseItems(value: unknown): WireItemRequest[] {
     bindings.sort((a, b) => a.env.localeCompare(b.env));
     return { name, bindings };
   });
+  // The grant store writes one row per (item, field) unit and caps a save at
+  // 20 units; hold the same line here so approval never exceeds what can be
+  // granted.
+  if (seenEnvs.size > MAX_UNITS_PER_REQUEST) {
+    throw new RequestError(`too many field bindings (max ${MAX_UNITS_PER_REQUEST})`);
+  }
+  return parsed;
 }
 
 export type ParsedRequest = {
@@ -274,7 +315,6 @@ export class RequestBroker {
       }))
     );
     const grantKeys = units.map((unit) => secretGrantKey(identity, unit));
-    const itemIds = [...new Set(units.map((unit) => unit.item_id))];
     const cardItems: ApprovalCardItem[] = request.items.map((item) => ({
       name: item.name,
       description: resolvedByName.get(item.name)!.description || undefined,
@@ -290,7 +330,7 @@ export class RequestBroker {
         const expiresAt = grants.map((grant) => grant.expires_at).sort()[0];
         const ttl = grants.map((grant) => grant.ttl)
           .sort((a, b) => secretGrantTtlHours(a) - secretGrantTtlHours(b))[0];
-        const sighting = this.deps.grants.recordSighting(identity, commandHash, itemIds);
+        const sighting = this.deps.grants.recordSighting(identity, commandHash, grantKeys);
         if (!sighting.seen_before) {
           const card: SightingCard = {
             id: request.request_id,
@@ -361,7 +401,7 @@ export class RequestBroker {
       expiresAt = saved.map((grant) => grant.expires_at).sort()[0];
       // The command just reviewed on the card must be remembered, or the next
       // fast-path hit would immediately re-notify.
-      this.deps.grants.recordSighting(identity, commandHash, itemIds);
+      this.deps.grants.recordSighting(identity, commandHash, grantKeys);
     }
     const envelope = await this.encryptForRequest(request, units);
     this.log(`request ${request.request_id}: approved ttl=${ttl} by ${decision.decided_by ?? "?"}`);
@@ -388,6 +428,11 @@ export class RequestBroker {
         if (value === undefined) throw new Error("vault did not return a requested credential");
         credentials[binding.env] = value;
       }
+    }
+    // Keep the payload under what the CLI will accept to decrypt (fail closed
+    // with a clear message instead of an opaque client-side rejection).
+    if (new TextEncoder().encode(JSON.stringify(credentials)).length > MAX_CREDENTIAL_PLAINTEXT_BYTES) {
+      throw new RequestError("credential payload too large for one request; split it", 500);
     }
     return encryptCredentialEnvelope(credentials, request.client_public_key_jwk, request.request_id);
   }
