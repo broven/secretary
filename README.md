@@ -2,32 +2,133 @@
 
 Approval-gated secrets for code agents, backed by Bitwarden / Vaultwarden.
 
-A code agent never sees your vault. It asks `secretary` to run a command with named
-credentials injected as environment variables; you approve (or reject) the request
-from Telegram; the secret values travel end-to-end encrypted from the broker to the
-agent's machine and exist only in the child process's environment.
+A code agent never sees your vault and never holds a standing credential. It
+asks secretary to run a command with named secrets injected as environment
+variables; you approve or reject the request from Telegram; the values travel
+end-to-end encrypted from the broker to the agent's machine and exist only in
+the child process's environment.
 
 ```
 code agent ──> secretary CLI ──HTTPS──> secretary broker ──> Bitwarden / Vaultwarden
                                               │
-                                              └──> Telegram (approval buttons: 1h / 8h / 7d / reject)
+                                              └──> Telegram (1h / 8h / 7d / reject)
 ```
 
-## Status
-
-Design phase. See [ARCHITECTURE.md](./ARCHITECTURE.md) for the full design,
-[CONTEXT.md](./CONTEXT.md) for the domain glossary, and [docs/adr/](./docs/adr/)
-for key decisions.
-
-This project is the successor of a Windmill-based pipeline; the rewrite exists to
-cut per-request latency from 10–30 s to under 1 s and to make the whole thing
-deployable by anyone with `docker compose up`.
-
-## Planned layout
-
+```sh
+$ secretary exec --reason "deploy needs the CF token" \
+    --item "cloudflare-api-dns-edit" password=CF_API_TOKEN \
+    -- npx wrangler deploy
+# → an approval card lands on the Owner's phone; on 批准, the command runs
+#   with CF_API_TOKEN set. Approve for 8h and repeats run instantly.
 ```
-server/   resident broker service (Bun/TypeScript)
-cli/      approved-secret CLI (compiled Bun binary, runs on the agent machine)
-skill/    agent skill definition (use-approved-secrets)
-deploy/   Dockerfile + docker-compose.yml (broker + optional vaultwarden profile)
+
+## Why
+
+Code agents need API keys, tokens, and passwords, but handing them a `.env`
+means every prompt-injected or simply confused agent holds your credentials
+forever. secretary replaces standing access with **per-use, human-approved,
+time-limited grants**:
+
+- **Every use is authorized.** A request is either covered by an unexpired
+  Grant or goes to the Owner's phone. No decision within the timeout →
+  fail closed.
+- **Grants are narrow and expire.** Keyed by (caller, client, repo, item,
+  field) with TTLs of 1h / 8h / 7d. The same secret in a different repo needs
+  its own approval.
+- **Inline code never earns trust.** `sh -c`, `python -c`, `node -e` (and
+  their combined-flag and `env`-wrapped variants) always require approval and
+  never create a Grant.
+- **You stay informed.** The first sighting of a new command under an
+  existing Grant sends a non-blocking notification with a one-tap revoke.
+- **Secrets stay sealed.** Envelope encryption (ephemeral P-256 ECDH +
+  HKDF-SHA256 + AES-256-GCM) means TLS terminators, tunnels, and proxies
+  between broker and CLI never see plaintext. Nothing is persisted server-side
+  but grants and sightings.
+- **It's fast.** A granted request is one HTTP round trip against a resident
+  vault session: sub-second in production (measured 0.7–0.9 s over a WireGuard
+  link, vs 10–30 s for the Windmill-orchestrated predecessor).
+
+## How it works
+
+The **broker** is the only stateful service: it logs into the vault once at
+startup and keeps an unlocked session resident (syncing on demand), stores
+Grants in SQLite, talks to Telegram via `getUpdates` long-polling (outbound
+only — no public webhook endpoint needed), and parks each pending request
+until the Owner taps a button or the timeout fires.
+
+The **CLI** runs on the agent machine behind a strict `env -i` wrapper: it
+validates the request, generates an ephemeral keypair, sends one long-polling
+HTTPS request, decrypts the envelope, and spawns the child command with the
+secrets in its environment — restoring the caller's `PATH`, and nothing else.
+
+Full design: [ARCHITECTURE.md](./ARCHITECTURE.md) · domain glossary:
+[CONTEXT.md](./CONTEXT.md) · key decisions: [docs/adr/](./docs/adr/).
+
+## Getting started
+
+### 1. Run the broker
+
+```sh
+git clone https://github.com/broven/secretary && cd secretary/deploy
+cp .env.example .env          # fill in vault + telegram settings
+# put secrets under deploy/secrets/ (bw_clientid, bw_clientsecret,
+# bw_password, telegram_bot_token) — docker secrets, never env
+docker compose up -d --build broker
+# or, to also run a bundled Vaultwarden:
+docker compose --profile vaultwarden up -d --build
 ```
+
+The broker binds `127.0.0.1:8787` by default — front it with your TLS
+ingress, tunnel, or VPN before widening the bind. Approvals need only
+outbound HTTPS. Step-by-step operator guide (bot setup, vault account,
+bundled-vaultwarden TLS): [deploy/README.md](./deploy/README.md).
+
+### 2. Register a client and install the CLI
+
+```sh
+docker exec <broker> bun run /app/server/src/cli_admin.ts client add my-mac
+# prints client_id + token, shown exactly once
+```
+
+```sh
+cd cli && ./build.sh            # bun test + compiled single binary
+secretary auth set-url https://secretary.example.com
+secretary auth set-client-id <client_id>
+secretary auth import           # prompts for the token → macOS Keychain
+```
+
+On Linux, `SECRETARY_URL` / `SECRETARY_TOKEN` env vars replace the Keychain.
+
+### 3. Use it
+
+```sh
+secretary list                  # safe catalog: names and fields, no values
+secretary exec --reason "why you need it" \
+  --item "ITEM NAME" field=ENV_NAME [--item ...] -- command args...
+```
+
+`field` is `password`, `username`, or a custom field name. Approve from the
+Telegram card; repeats within the TTL run without a card. For code agents,
+put the `secretary` wrapper script on `PATH` and tell the agent to use it for
+any credential need — the approval discipline comes with the tool.
+
+## Status & scope
+
+Running in production for its author. Single Owner by design; Telegram is the
+first Approver implementation behind a small interface. Not yet: multi-user
+approval flows, Windows CLI, a web approval fallback. Vault compatibility:
+official Bitwarden and Vaultwarden (anything the `bw` CLI accepts — the
+broker requires an https vault URL).
+
+## Development
+
+```sh
+bun test                                   # unit + integration (fake vault/Telegram)
+INTEGRATION_REAL_BW=1 bun test server/test/real_bw.test.ts   # real vaultwarden + bw
+bun run deploy/smoke.ts                    # full compose e2e smoke
+bun run deploy/live_test.ts                # guided live test against real Telegram
+```
+
+The integration suite drives the real broker against a fake Telegram server
+and injected vault; the smoke test builds the image and runs the compiled CLI
+against a throwaway vaultwarden. No mocks of secretary's own code.

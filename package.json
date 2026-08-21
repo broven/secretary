@@ -1,0 +1,8 @@
+{
+  "name": "secretary",
+  "private": true,
+  "workspaces": ["server", "cli"],
+  "scripts": {
+    "test": "bun test"
+  }
+}
