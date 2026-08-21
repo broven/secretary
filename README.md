@@ -83,44 +83,49 @@ ingress, tunnel, or VPN before widening the bind. Approvals need only
 outbound HTTPS. Step-by-step operator guide (bot setup, vault account,
 bundled-vaultwarden TLS): [deploy/README.md](./deploy/README.md).
 
-### 2. Register a client and install the CLI
+### 2. Register a client
 
 ```sh
 docker exec <broker> bun run /app/server/src/cli_admin.ts client add my-mac
 # prints client_id + token, shown exactly once
 ```
 
-On the agent machine, one command builds the CLI, installs the agent-facing
-skill, and puts `approved-secret` on your PATH (requires [bun](https://bun.sh)):
+### 3. Set up the agent machine
+
+Two commands. The first installs the CLI — a prebuilt binary for your platform,
+checksum-verified, no bun or compiler needed:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/broven/secretary/main/install.sh | sh
 ```
 
-Prefer to read before you run — it is a shell script from the internet:
+The second installs the agent-facing skill, and asks which of your code agents
+should get it:
+
+```sh
+npx skills add broven/secretary --skill use-approved-secrets
+```
+
+Prefer to read the installer before running it — it is a shell script from the
+internet:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/broven/secretary/main/install.sh -o install.sh
 less install.sh && sh install.sh
 ```
 
-It installs into `~/.agents/skills/use-approved-secrets/` and links
-`~/.local/bin/approved-secret`; override with `SECRETARY_SKILL_DIR` /
-`SECRETARY_BIN_DIR`. From a checkout, `sh install.sh` does the same without
-downloading anything.
+It installs into `~/.local/share/secretary/` and links `~/.local/bin/approved-secret`;
+override with `SECRETARY_DIR` / `SECRETARY_BIN_DIR`, or pin a release with
+`SECRETARY_VERSION=vX.Y.Z`.
 
-Then the two bootstrap steps, which are yours alone — a token must never be
-pasted into an agent's conversation:
+Then the bootstrap, which is yours alone — a token must never be pasted into an
+agent's conversation:
 
 ```sh
 approved-secret auth set-url https://secretary.example.com
 approved-secret auth set-client-id <client_id>
 approved-secret auth import     # prompts for the token → macOS Keychain
 ```
-
-The skill alone (documentation, no CLI) can also be pulled with
-`npx skills add broven/secretary --skill use-approved-secrets`, but the
-contract it describes needs the compiled binary above to be of any use.
 
 On Linux, `SECRETARY_URL` / `SECRETARY_TOKEN` env vars replace the Keychain.
 
