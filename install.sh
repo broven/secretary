@@ -16,6 +16,9 @@
 #   SECRETARY_DIR       where the binary and wrapper live
 #   SECRETARY_BIN_DIR   directory to link `approved-secret` into
 #   SECRETARY_SKIP_SKILL=1   install only the CLI
+#   SECRETARY_YES=1          install the skill without asking anything — for a
+#                            code agent setting this up on someone's behalf
+#   SECRETARY_SKILL_SCOPE    global (default under SECRETARY_YES) or project
 set -eu
 
 REPO=${SECRETARY_REPO:-broven/secretary}
@@ -101,6 +104,8 @@ esac
 # terminal; where there is none (CI, a background run), print the command
 # rather than guessing on the user's behalf.
 skill_cmd="npx skills add $REPO"
+scope_flag=""
+[ "${SECRETARY_SKILL_SCOPE:-global}" = "global" ] && scope_flag="-g"
 
 if [ "${SECRETARY_SKIP_SKILL:-}" = "1" ]; then
   echo
@@ -109,28 +114,48 @@ elif ! command -v npx >/dev/null 2>&1; then
   echo
   echo "npx not found, so the agent skill was not installed."
   echo "Install Node.js, then run:  $skill_cmd"
-# `[ -r /dev/tty ]` only checks permission bits; with no controlling terminal
-# the file is there but opening it fails. Actually open it.
+elif [ "${SECRETARY_YES:-}" = "1" ]; then
+  # Unattended: --all is `--skill '*' --agent '*' -y`, so nothing is asked.
+  # Scope defaults to global because an unattended run's working directory is
+  # whatever the caller happened to be in, which is a poor place to leave a
+  # project-scoped install.
+  echo
+  echo "installing the agent skill (unattended, ${SECRETARY_SKILL_SCOPE:-global} scope) …"
+  # shellcheck disable=SC2086
+  npx --yes skills add "$REPO" --all $scope_flag \
+    || { echo; echo "the skill step failed; retry with:  $skill_cmd"; }
 elif { : </dev/tty; } 2>/dev/null; then
   echo
   echo "Installing the agent skill — it will ask which agents and which scope."
-  # shellcheck disable=SC2086
   npx --yes skills add "$REPO" </dev/tty >/dev/tty 2>&1 \
     || { echo; echo "the skill step failed; you can retry it any time:  $skill_cmd"; }
 else
   echo
-  echo "No terminal available for the interactive skill installer. Run:"
+  echo "No terminal available for the interactive skill installer. Either run:"
   echo "  $skill_cmd"
+  echo "or re-run this installer with SECRETARY_YES=1 to install it unattended."
 fi
 
-cat <<'NEXT'
+cat <<NEXT
 
-Last step, and it is yours alone — a token must never be pasted into an agent's
-conversation:
+Last step: point the CLI at your broker. Both values come from the machine
+running it, and the token is yours alone to handle — it must never be pasted
+into an agent's conversation.
 
-  approved-secret auth set-url https://your-broker.example
-  approved-secret auth set-client-id <client_id>
+  approved-secret auth set-url <broker URL>
+      Where your broker listens, as reachable from THIS machine. If you put it
+      behind a tunnel or reverse proxy, that public address; if you keep it on
+      a private network (recommended), the tailnet/VPN one — e.g.
+      https://secretary.example.com or http://100.64.0.1:8787
+
   approved-secret auth import
+      Pastes the client token. Get it on the broker host with:
+        docker compose exec broker bun run server/src/cli_admin.ts client add <a name for this machine>
+      It prints a client_id and a token, and shows the token exactly once.
+
+  approved-secret auth set-client-id <client_id>
+      Optional. The token already identifies this machine; setting the id just
+      makes the broker cross-check the two.
 
 Then check it works:
 
