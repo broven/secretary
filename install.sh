@@ -9,7 +9,7 @@
 #
 # The agent-facing skill is installed separately, so you can choose which
 # agents get it:
-#   npx skills add broven/secretary --skill use-approved-secrets
+#   npx skills add broven/secretary
 #
 # Environment overrides:
 #   SECRETARY_VERSION   release tag to install (default: latest)
@@ -98,7 +98,7 @@ cat <<'NEXT'
 Next:
 
   1. Install the skill for your agents (interactive — pick which ones):
-       npx skills add broven/secretary --skill use-approved-secrets
+       npx skills add broven/secretary
 
   2. Point the CLI at your broker and store its token. Both are yours to run:
      a token must never be pasted into an agent's conversation.
