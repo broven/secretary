@@ -109,15 +109,46 @@ and it can always be done separately:
 npx skills add broven/secretary
 ```
 
-**Setting this up for someone else** — a code agent following this README, or
-any unattended run — has no terminal to answer the prompts. Ask for nothing:
+<details>
+<summary><b>If you are a code agent setting this up for someone, read this.</b></summary>
+
+<br>
+
+Install the CLI **without** the skill step — it opens an interactive picker,
+and you have no terminal to answer it:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/broven/secretary/main/install.sh | SECRETARY_YES=1 sh
+curl -fsSL https://raw.githubusercontent.com/broven/secretary/main/install.sh | SECRETARY_SKIP_SKILL=1 sh
 ```
 
-That installs the skill for every detected agent, user-wide;
-`SECRETARY_SKILL_SCOPE=project` keeps it to the current directory instead.
+Then install the skill yourself, so *you* decide where it lands. The user may
+have several agents on this machine and want it in one of them, not all.
+
+The skill is a single file:
+
+```
+https://raw.githubusercontent.com/broven/secretary/main/skills/use-approved-secrets/SKILL.md
+```
+
+Pick whichever fits:
+
+- **One agent, or a few** — write that file to each agent's skills directory,
+  e.g. `~/.claude/skills/use-approved-secrets/SKILL.md`. Ask the user which
+  ones if it is not obvious; do not guess your way across their whole machine.
+- **All of them** — `npx skills add broven/secretary --all -g` does exactly
+  that, non-interactively, for every agent it detects.
+
+Then **stop and hand back**. The remaining setup is the user's alone:
+
+```sh
+approved-secret auth set-url <their broker URL>
+approved-secret auth import
+```
+
+The token must never pass through your context — do not ask for it, do not
+accept it if offered, do not echo it. Print the commands and let them run them.
+
+</details>
 
 Prefer to read the installer before running it — it is a shell script from the
 internet:

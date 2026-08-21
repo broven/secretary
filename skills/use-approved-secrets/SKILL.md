@@ -15,12 +15,10 @@ run:
 curl -fsSL https://raw.githubusercontent.com/broven/secretary/main/install.sh | sh
 ```
 
-If you are running it for them, add `SECRETARY_YES=1` — you have no terminal to
-answer its prompts:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/broven/secretary/main/install.sh | SECRETARY_YES=1 sh
-```
+If you are running it for them, add `SECRETARY_SKIP_SKILL=1` — the default path
+opens an interactive picker you have no terminal to answer — and see the
+"code agent" section of the repository README for how to place this file
+yourself.
 
 Then the user points it at their broker: `auth set-url <their broker URL>` and
 `auth import` (the token comes from `client add` on the broker host). Those two
