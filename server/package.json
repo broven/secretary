@@ -1,0 +1,12 @@
+{
+  "name": "secretary-server",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/main.ts",
+    "admin": "bun run src/cli_admin.ts"
+  },
+  "devDependencies": {
+    "bun-types": "^1.3.0"
+  }
+}

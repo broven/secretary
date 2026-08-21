@@ -1,0 +1,372 @@
+// Bitwarden secret-use grants, persisted in SQLite.
+//
+// Stores only "which caller/client/repo was approved to use which item's
+// which field" — never credential values, Bitwarden sessions, or request
+// refs. On a grant hit the worker still re-reads the vault.
+//
+// Since v3 one row = one (caller, client, repo, item_id, field), so
+// authorization is containment matching: after approving {A,B}, a later
+// request for just {A} hits directly. Item identity is the bare item_id
+// without revision, so rotating a password / editing notes does not revoke
+// grants by association (per-request revision tamper checks stay elsewhere).
+//
+// Ported from the Windmill grant_store.ts reference (Postgres DataTable)
+// to bun:sqlite. Timestamps are stored as unix milliseconds and exposed as
+// ISO strings.
+
+import type { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
+import {
+  isSecretGrantTtl,
+  type SecretField,
+  type SecretGrantTtl,
+  secretGrantTtlHours,
+} from "./types.ts";
+
+export const SECRET_GRANT_TABLE = "secret_grants";
+export const SECRET_SIGHTING_TABLE = "secret_command_sightings";
+
+/** Sightings only answer "have we seen this command"; 90 days covers the
+ * reuse window of the longest 7d grant. */
+export const SIGHTING_RETENTION_DAYS = 90;
+const SIGHTING_RETENTION_MS = SIGHTING_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
+
+/** Stable identity of a call; grants and sightings both hang off it. */
+export type SecretGrantIdentity = {
+  caller_id: string;
+  client_id: string;
+  repo: string;
+};
+
+/** Smallest grantable unit: one field of one Bitwarden item. */
+export type SecretGrantUnit = {
+  item_id: string;
+  field: SecretField;
+};
+
+export type SecretGrant = SecretGrantUnit & {
+  grant_key: string;
+  caller_id: string;
+  client_id: string;
+  repo: string;
+  ttl: SecretGrantTtl;
+  approval_id: string;
+  /** ISO timestamp. */
+  expires_at: string;
+  decided_by?: string;
+  /** ISO timestamp. */
+  decided_at?: string;
+};
+
+export function assertSecretClientId(value: string): string {
+  const clientId = String(value || "").trim();
+  // Relaxed from the reference's {8,128}: client names can be short.
+  if (!/^[A-Za-z0-9._:-]{1,128}$/.test(clientId)) throw new Error("invalid client_id");
+  return clientId;
+}
+
+export function assertSecretRepo(value: string): string {
+  const repo = String(value || "").trim();
+  if (!repo || repo.length > 200 || CONTROL_CHARACTERS.test(repo)) throw new Error("invalid repo");
+  return repo;
+}
+
+export function assertSecretItemId(value: string): string {
+  const itemId = String(value || "").trim();
+  if (!/^[A-Za-z0-9-]{8,128}$/.test(itemId)) throw new Error("invalid grant item_id");
+  return itemId;
+}
+
+function assertSecretField(value: string): SecretField {
+  if (value !== "username" && value !== "password") throw new Error("invalid grant field");
+  return value;
+}
+
+function normalizeIdentity(identity: SecretGrantIdentity): SecretGrantIdentity {
+  return {
+    caller_id: assertSecretClientId(identity.caller_id),
+    client_id: assertSecretClientId(identity.client_id),
+    repo: assertSecretRepo(identity.repo),
+  };
+}
+
+/**
+ * Primary key of one grant unit.
+ *
+ * Deliberately excludes the env alias and revision: env is only a local
+ * alias — renaming it does not change the value released; a revision change
+ * means a rotated password, which is a new value of the same authorization
+ * object, not a new authorization object.
+ */
+export function secretGrantKey(identity: SecretGrantIdentity, unit: SecretGrantUnit): string {
+  const scope = normalizeIdentity(identity);
+  return createHash("sha256").update(JSON.stringify({
+    v: 3,
+    caller_id: scope.caller_id,
+    client_id: scope.client_id,
+    repo: scope.repo,
+    item_id: assertSecretItemId(unit.item_id),
+    field: assertSecretField(unit.field),
+  })).digest("hex");
+}
+
+export function assertSecretGrantKey(value: string): string {
+  if (typeof value !== "string" || !/^[a-f0-9]{64}$/.test(value)) throw new Error("invalid grant_key");
+  return value;
+}
+
+/** Command fingerprint hashes argv only: swapping env aliases must not read
+ * as a "new command" that bothers the user. */
+export function commandFingerprint(argv: string[]): string {
+  if (!Array.isArray(argv) || argv.length === 0) throw new Error("invalid command argv");
+  return createHash("sha256").update(JSON.stringify(argv)).digest("hex");
+}
+
+/**
+ * Sighting key = identity + command fingerprint + item set.
+ *
+ * The item set is included to catch "this command got this key for the first
+ * time" — the same command picking up a higher-privilege key is a new fact
+ * worth knowing; mere repetition is not.
+ */
+export function commandSightingKey(
+  identity: SecretGrantIdentity,
+  commandHash: string,
+  itemIds: string[],
+): string {
+  const scope = normalizeIdentity(identity);
+  if (typeof commandHash !== "string" || !/^[a-f0-9]{64}$/.test(commandHash)) {
+    throw new Error("invalid command_hash");
+  }
+  const items = [...new Set((itemIds || []).map(assertSecretItemId))].sort();
+  if (items.length === 0 || items.length > 10) throw new Error("invalid sighting item count");
+  return createHash("sha256").update(JSON.stringify({
+    v: 1,
+    caller_id: scope.caller_id,
+    client_id: scope.client_id,
+    repo: scope.repo,
+    command_hash: commandHash,
+    items,
+  })).digest("hex");
+}
+
+type GrantRow = {
+  grant_key: string;
+  caller_id: string;
+  client_id: string;
+  repo: string;
+  item_id: string;
+  field: string;
+  ttl: string;
+  approval_id: string;
+  decided_by: string | null;
+  decided_at: string | null;
+  expires_at: number;
+};
+
+function rowToGrant(row: GrantRow): SecretGrant {
+  if (!isSecretGrantTtl(row.ttl)) throw new Error("invalid grant ttl");
+  return {
+    grant_key: row.grant_key,
+    caller_id: row.caller_id,
+    client_id: row.client_id,
+    repo: row.repo,
+    item_id: assertSecretItemId(row.item_id),
+    field: assertSecretField(row.field),
+    ttl: row.ttl,
+    approval_id: row.approval_id,
+    expires_at: new Date(row.expires_at).toISOString(),
+    decided_by: row.decided_by ?? undefined,
+    decided_at: row.decided_at ?? undefined,
+  };
+}
+
+export class GrantStore {
+  private readonly db: Database;
+  private readonly now: () => number;
+
+  constructor(db: Database, now: () => number = Date.now) {
+    this.db = db;
+    this.now = now;
+    this.ensureTables();
+    this.sweep();
+  }
+
+  private ensureTables(): void {
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS ${SECRET_GRANT_TABLE} (
+        grant_key TEXT PRIMARY KEY,
+        caller_id TEXT NOT NULL,
+        client_id TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        field TEXT NOT NULL,
+        ttl TEXT NOT NULL,
+        approval_id TEXT NOT NULL,
+        decided_by TEXT,
+        decided_at TEXT,
+        expires_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `);
+    this.db.run(
+      `CREATE INDEX IF NOT EXISTS secret_grants_expires_at_idx ON ${SECRET_GRANT_TABLE} (expires_at)`,
+    );
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS ${SECRET_SIGHTING_TABLE} (
+        sighting_key TEXT PRIMARY KEY,
+        caller_id TEXT NOT NULL,
+        client_id TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        command_hash TEXT NOT NULL,
+        first_seen_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL
+      )
+    `);
+  }
+
+  /**
+   * Containment-matching read side: query all requested units at once; a
+   * request only counts as a hit when every unit hits. The caller gets a
+   * key -> grant map — whatever is missing is what needs re-approval.
+   */
+  findActive(grantKeys: string[]): Map<string, SecretGrant> {
+    const keys = [...new Set((grantKeys || []).map(assertSecretGrantKey))];
+    if (keys.length === 0 || keys.length > 20) throw new Error("invalid grant_key count");
+    const placeholders = keys.map(() => "?").join(", ");
+    const rows = this.db.query<GrantRow, [...string[], number]>(
+      `SELECT grant_key, caller_id, client_id, repo, item_id, field, ttl, approval_id,
+              decided_by, decided_at, expires_at
+         FROM ${SECRET_GRANT_TABLE}
+        WHERE grant_key IN (${placeholders}) AND expires_at > ?`,
+    ).all(...keys, this.now());
+    const found = new Map<string, SecretGrant>();
+    for (const row of rows) {
+      const grant = rowToGrant(row);
+      found.set(grant.grant_key, grant);
+    }
+    return found;
+  }
+
+  /**
+   * Write side: one approval writes one row per grant unit.
+   *
+   * expires_at takes the MAX of old and new so that a top-up approval for B
+   * never shortens A's existing longer grant; shortening or revoking only
+   * ever happens through the revoke path.
+   */
+  save(
+    identity: SecretGrantIdentity,
+    units: SecretGrantUnit[],
+    ttl: SecretGrantTtl,
+    approvalId: string,
+    decidedBy?: string,
+    decidedAt?: string,
+  ): SecretGrant[] {
+    const scope = normalizeIdentity(identity);
+    if (!isSecretGrantTtl(ttl)) throw new Error("invalid grant ttl");
+    if (!/^[A-Za-z0-9_-]{8,80}$/.test(approvalId)) throw new Error("invalid approval_id");
+    if (!Array.isArray(units) || units.length === 0 || units.length > 20) {
+      throw new Error("invalid grant unit count");
+    }
+    const nowMs = this.now();
+    const expiresAt = nowMs + secretGrantTtlHours(ttl) * 60 * 60 * 1000;
+    const upsert = this.db.query(
+      `INSERT INTO ${SECRET_GRANT_TABLE}
+         (grant_key, caller_id, client_id, repo, item_id, field, ttl, approval_id,
+          decided_by, decided_at, expires_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(grant_key) DO UPDATE SET
+         ttl = excluded.ttl,
+         approval_id = excluded.approval_id,
+         decided_by = excluded.decided_by,
+         decided_at = excluded.decided_at,
+         expires_at = MAX(${SECRET_GRANT_TABLE}.expires_at, excluded.expires_at),
+         updated_at = excluded.updated_at`,
+    );
+    const readBack = this.db.query<GrantRow, [string]>(
+      `SELECT grant_key, caller_id, client_id, repo, item_id, field, ttl, approval_id,
+              decided_by, decided_at, expires_at
+         FROM ${SECRET_GRANT_TABLE}
+        WHERE grant_key = ?`,
+    );
+    const saved: SecretGrant[] = [];
+    for (const unit of units) {
+      const itemId = assertSecretItemId(unit.item_id);
+      const field = assertSecretField(unit.field);
+      const key = secretGrantKey(scope, { item_id: itemId, field });
+      upsert.run(
+        key,
+        scope.caller_id,
+        scope.client_id,
+        scope.repo,
+        itemId,
+        field,
+        ttl,
+        approvalId,
+        decidedBy || null,
+        decidedAt || null,
+        expiresAt,
+        nowMs,
+        nowMs,
+      );
+      const row = readBack.get(key);
+      if (!row) throw new Error("failed to save secret grant");
+      saved.push(rowToGrant(row));
+    }
+    return saved;
+  }
+
+  /** Emergency brake: delete only the given rows, leaving the repo's other
+   * grants untouched. Returns the number of rows deleted. */
+  revoke(grantKeys: string[]): number {
+    const keys = [...new Set((grantKeys || []).map(assertSecretGrantKey))];
+    if (keys.length === 0 || keys.length > 20) throw new Error("invalid grant_key count");
+    const placeholders = keys.map(() => "?").join(", ");
+    const result = this.db.run(
+      `DELETE FROM ${SECRET_GRANT_TABLE} WHERE grant_key IN (${placeholders})`,
+      keys,
+    );
+    return result.changes;
+  }
+
+  /**
+   * Record and report "has this command been seen with this key set".
+   *
+   * The approval path records too: a command the user just read verbatim on
+   * the approval card should not bother them again on the next reuse.
+   */
+  recordSighting(
+    identity: SecretGrantIdentity,
+    commandHash: string,
+    itemIds: string[],
+  ): { key: string; seen_before: boolean } {
+    const scope = normalizeIdentity(identity);
+    const key = commandSightingKey(scope, commandHash, itemIds);
+    const existing = this.db.query<{ sighting_key: string }, [string]>(
+      `SELECT sighting_key FROM ${SECRET_SIGHTING_TABLE} WHERE sighting_key = ?`,
+    ).get(key);
+    const nowMs = this.now();
+    this.db.run(
+      `INSERT INTO ${SECRET_SIGHTING_TABLE}
+         (sighting_key, caller_id, client_id, repo, command_hash, first_seen_at, last_seen_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(sighting_key) DO UPDATE SET last_seen_at = excluded.last_seen_at`,
+      [key, scope.caller_id, scope.client_id, scope.repo, commandHash, nowMs, nowMs],
+    );
+    return { key, seen_before: Boolean(existing) };
+  }
+
+  /** Delete expired grants and sightings past the retention window. */
+  sweep(): void {
+    const nowMs = this.now();
+    this.db.run(`DELETE FROM ${SECRET_GRANT_TABLE} WHERE expires_at <= ?`, [nowMs]);
+    this.db.run(
+      `DELETE FROM ${SECRET_SIGHTING_TABLE} WHERE last_seen_at < ?`,
+      [nowMs - SIGHTING_RETENTION_MS],
+    );
+  }
+}
