@@ -7,7 +7,8 @@ import { afterAll, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BwVault, valueKey } from "../src/vault";
+import { BwVault, itemFieldValue, valueKey } from "../src/vault";
+import { cloneItem, dropItemField, newLoginItemPayload, setItemField } from "../src/writes";
 import {
   bwSubprocessPath,
   createLoginItemWithBw,
@@ -26,6 +27,8 @@ const MASTER_PASSWORD = "secretary-it-master-9f2c";
 const ITEM_NAME = "Secretary Test Item";
 const ITEM_PASSWORD = "s3cret-value-xyz";
 const ITEM_USERNAME = "svc-user";
+const WRITE_ITEM_NAME = "Secretary Write Item";
+const WRITE_ITEM_DESCRIPTION = "created by the secretary write-path integration test";
 
 const cleanups: Array<() => Promise<void>> = [];
 
@@ -100,4 +103,51 @@ test.skipIf(!enabled)("real vaultwarden + real bw CLI end to end", async () => {
   ]);
   expect(values.get(valueKey(resolved.item_id, "password"))).toBe(ITEM_PASSWORD);
   expect(values.get(valueKey(resolved.item_id, "username"))).toBe(ITEM_USERNAME);
-}, 240_000);
+
+  // -- write surface, against the same real bw + vaultwarden ----------------
+  // The fake-vault unit tests cannot prove the payload shape `bw serve`
+  // actually accepts; this is the only place that does.
+
+  expect(await vault.findItemsByName(WRITE_ITEM_NAME)).toHaveLength(0);
+  await vault.createItem(newLoginItemPayload(
+    WRITE_ITEM_NAME,
+    WRITE_ITEM_DESCRIPTION,
+    new Map([["username", "write-user"], ["password", "write-pass-1"], ["api_key", "write-key-1"]]),
+  ));
+
+  const [created] = await vault.findItemsByName(WRITE_ITEM_NAME);
+  expect(created).toBeDefined();
+  expect(created.description).toBe(WRITE_ITEM_DESCRIPTION);
+  expect(created.field_names).toContain("api_key");
+  // A hidden custom field must be readable by the read path, or the write
+  // would produce an item the broker can see but never deliver.
+  const createdValues = await vault.readValues([
+    { item_id: created.item_id, field: "password" },
+    { item_id: created.item_id, field: "api_key" },
+  ]);
+  expect(createdValues.get(valueKey(created.item_id, "password"))).toBe("write-pass-1");
+  expect(createdValues.get(valueKey(created.item_id, "api_key"))).toBe("write-key-1");
+
+  const writeCatalog = await vault.catalog(WRITE_ITEM_NAME);
+  expect(writeCatalog[0]?.created_at).toBeTruthy();
+
+  // Update a value through a full-replace edit built from the raw item.
+  const rotated = cloneItem(created.raw);
+  setItemField(rotated, "password", "write-pass-2");
+  await vault.replaceItem(created.item_id, rotated);
+  const [afterRotate] = await vault.findItemsByName(WRITE_ITEM_NAME);
+  expect(itemFieldValue(afterRotate.raw, "password")).toBe("write-pass-2");
+  expect(itemFieldValue(afterRotate.raw, "api_key")).toBe("write-key-1");
+
+  // Drop one field; the rest of the item survives.
+  const trimmed = cloneItem(afterRotate.raw);
+  dropItemField(trimmed, "api_key");
+  await vault.replaceItem(afterRotate.item_id, trimmed);
+  const [afterDrop] = await vault.findItemsByName(WRITE_ITEM_NAME);
+  expect(afterDrop.field_names).not.toContain("api_key");
+  expect(itemFieldValue(afterDrop.raw, "password")).toBe("write-pass-2");
+
+  // Soft delete: gone from the vault, recoverable from its trash.
+  await vault.trashItem(afterDrop.item_id);
+  expect(await vault.findItemsByName(WRITE_ITEM_NAME)).toHaveLength(0);
+}, 300_000);

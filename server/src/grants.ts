@@ -27,6 +27,10 @@ import { isValidFieldName } from "./vault.ts";
 export const SECRET_GRANT_TABLE = "secret_grants";
 export const SECRET_SIGHTING_TABLE = "secret_command_sightings";
 export const REVOKE_HANDLE_TABLE = "secret_revoke_handles";
+export const GRANT_REVOCATION_TABLE = "secret_grant_revocations";
+
+/** Empty is not a valid Field name, so it safely represents the whole Item. */
+const ITEM_REVOCATION_SCOPE = "";
 
 /** Sightings only answer "have we seen this command"; 90 days covers the
  * reuse window of the longest 7d grant. */
@@ -61,6 +65,20 @@ export type SecretGrant = SecretGrantUnit & {
   /** ISO timestamp. */
   decided_at?: string;
 };
+
+/** Generations captured after vault resolution and checked when Approval settles. */
+export type GrantRevocationSnapshot = ReadonlyMap<string, number>;
+
+export class GrantRevokedDuringApprovalError extends Error {
+  constructor() {
+    super("审批期间条目或字段已被移除，请重新发起请求");
+    this.name = "GrantRevokedDuringApprovalError";
+  }
+}
+
+function revocationKey(itemId: string, field: string): string {
+  return `${itemId}\0${field}`;
+}
 
 export function assertSecretClientId(value: string): string {
   const clientId = String(value || "").trim();
@@ -244,6 +262,18 @@ export class GrantStore {
         created_at INTEGER NOT NULL
       )
     `);
+    // A generation is advanced before a destructive vault mutation. Pending
+    // reads carry the generations they observed after name resolution, so a
+    // late Approval cannot recreate a Grant for a removed Item or Field.
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS ${GRANT_REVOCATION_TABLE} (
+        item_id TEXT NOT NULL,
+        field TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (item_id, field)
+      )
+    `);
   }
 
   /** Persist the handle → grant-keys mapping for a Sighting's revoke button. */
@@ -300,6 +330,82 @@ export class GrantStore {
   }
 
   /**
+   * Live grants naming this Item, optionally narrowed to one Field.
+   *
+   * The write path needs this twice: to put a destructive Write Request's blast
+   * radius on the approval card, and to clear the rows afterwards. Unlike
+   * findActive it is keyed by the Item itself, because a Remove has no grant
+   * keys to look up — it is destroying the thing they point at.
+   */
+  activeForItem(itemId: string, field?: string): SecretGrant[] {
+    const item = assertSecretItemId(itemId);
+    const rows = field === undefined
+      ? this.db.query<GrantRow, [string, number]>(
+        `SELECT grant_key, caller_id, client_id, repo, item_id, field, ttl, approval_id,
+                decided_by, decided_at, expires_at
+           FROM ${SECRET_GRANT_TABLE}
+          WHERE item_id = ? AND expires_at > ?`,
+      ).all(item, this.now())
+      : this.db.query<GrantRow, [string, string, number]>(
+        `SELECT grant_key, caller_id, client_id, repo, item_id, field, ttl, approval_id,
+                decided_by, decided_at, expires_at
+           FROM ${SECRET_GRANT_TABLE}
+          WHERE item_id = ? AND field = ? AND expires_at > ?`,
+      ).all(item, assertSecretField(field), this.now());
+    return rows.map(rowToGrant);
+  }
+
+  /** Snapshot the durable generations a pending Approval is allowed to save against. */
+  snapshotRevocations(units: SecretGrantUnit[]): GrantRevocationSnapshot {
+    if (!Array.isArray(units) || units.length === 0 || units.length > 20) {
+      throw new Error("invalid grant unit count");
+    }
+    const generation = this.db.query<{ generation: number }, [string, string]>(
+      `SELECT generation FROM ${GRANT_REVOCATION_TABLE} WHERE item_id = ? AND field = ?`,
+    );
+    const snapshot = new Map<string, number>();
+    for (const unit of units) {
+      const itemId = assertSecretItemId(unit.item_id);
+      const field = assertSecretField(unit.field);
+      for (const scope of [ITEM_REVOCATION_SCOPE, field]) {
+        const key = revocationKey(itemId, scope);
+        if (!snapshot.has(key)) snapshot.set(key, generation.get(itemId, scope)?.generation ?? 0);
+      }
+    }
+    return snapshot;
+  }
+
+  /**
+   * Advance the revocation generation and delete matching rows atomically.
+   *
+   * Advancing first prevents an Approval that was already pending from writing
+   * a Grant after this deletion. The marker persists across broker restarts and
+   * Bitwarden trash restoration; a fresh Request captures the new generation.
+   */
+  revokeForItem(itemId: string, field?: string): number {
+    const item = assertSecretItemId(itemId);
+    const scope = field === undefined ? ITEM_REVOCATION_SCOPE : assertSecretField(field);
+    const revoke = this.db.transaction(() => {
+      this.db.run(
+        `INSERT INTO ${GRANT_REVOCATION_TABLE} (item_id, field, generation, updated_at)
+         VALUES (?, ?, 1, ?)
+         ON CONFLICT(item_id, field) DO UPDATE SET
+           generation = ${GRANT_REVOCATION_TABLE}.generation + 1,
+           updated_at = excluded.updated_at`,
+        [item, scope, this.now()],
+      );
+      const result = field === undefined
+        ? this.db.run(`DELETE FROM ${SECRET_GRANT_TABLE} WHERE item_id = ?`, [item])
+        : this.db.run(
+          `DELETE FROM ${SECRET_GRANT_TABLE} WHERE item_id = ? AND field = ?`,
+          [item, scope],
+        );
+      return result.changes;
+    });
+    return revoke.immediate();
+  }
+
+  /**
    * Write side: one approval writes one row per grant unit.
    *
    * expires_at takes the MAX of old and new so that a top-up approval for B
@@ -313,6 +419,7 @@ export class GrantStore {
     approvalId: string,
     decidedBy?: string,
     decidedAt?: string,
+    revocationSnapshot?: GrantRevocationSnapshot,
   ): SecretGrant[] {
     const scope = normalizeIdentity(identity);
     if (!isSecretGrantTtl(ttl)) throw new Error("invalid grant ttl");
@@ -320,6 +427,10 @@ export class GrantStore {
     if (!Array.isArray(units) || units.length === 0 || units.length > 20) {
       throw new Error("invalid grant unit count");
     }
+    const normalizedUnits = units.map((unit) => ({
+      item_id: assertSecretItemId(unit.item_id),
+      field: assertSecretField(unit.field),
+    }));
     const nowMs = this.now();
     const expiresAt = nowMs + secretGrantTtlHours(ttl) * 60 * 60 * 1000;
     const upsert = this.db.query(
@@ -341,31 +452,48 @@ export class GrantStore {
          FROM ${SECRET_GRANT_TABLE}
         WHERE grant_key = ?`,
     );
-    const saved: SecretGrant[] = [];
-    for (const unit of units) {
-      const itemId = assertSecretItemId(unit.item_id);
-      const field = assertSecretField(unit.field);
-      const key = secretGrantKey(scope, { item_id: itemId, field });
-      upsert.run(
-        key,
-        scope.caller_id,
-        scope.client_id,
-        scope.repo,
-        itemId,
-        field,
-        ttl,
-        approvalId,
-        decidedBy || null,
-        decidedAt || null,
-        expiresAt,
-        nowMs,
-        nowMs,
-      );
-      const row = readBack.get(key);
-      if (!row) throw new Error("failed to save secret grant");
-      saved.push(rowToGrant(row));
-    }
-    return saved;
+    const currentGeneration = this.db.query<{ generation: number }, [string, string]>(
+      `SELECT generation FROM ${GRANT_REVOCATION_TABLE} WHERE item_id = ? AND field = ?`,
+    );
+    const persist = this.db.transaction(() => {
+      if (revocationSnapshot) {
+        for (const unit of normalizedUnits) {
+          for (const revocationField of [ITEM_REVOCATION_SCOPE, unit.field]) {
+            const key = revocationKey(unit.item_id, revocationField);
+            const expected = revocationSnapshot.get(key);
+            const current = currentGeneration.get(unit.item_id, revocationField)?.generation ?? 0;
+            if (expected === undefined || current !== expected) {
+              throw new GrantRevokedDuringApprovalError();
+            }
+          }
+        }
+      }
+
+      const saved: SecretGrant[] = [];
+      for (const unit of normalizedUnits) {
+        const key = secretGrantKey(scope, unit);
+        upsert.run(
+          key,
+          scope.caller_id,
+          scope.client_id,
+          scope.repo,
+          unit.item_id,
+          unit.field,
+          ttl,
+          approvalId,
+          decidedBy || null,
+          decidedAt || null,
+          expiresAt,
+          nowMs,
+          nowMs,
+        );
+        const row = readBack.get(key);
+        if (!row) throw new Error("failed to save secret grant");
+        saved.push(rowToGrant(row));
+      }
+      return saved;
+    });
+    return persist.immediate();
   }
 
   /** Emergency brake: delete only the given rows, leaving the repo's other

@@ -41,6 +41,12 @@ const MAX_ITEMS = 10;
 const EXEC_USAGE =
   "用法：secretary exec --reason \"申请理由\" --item ITEM field=ENV[,field=ENV] [--item ITEM field=ENV ...] -- command...";
 const AUTH_USAGE = "用法：secretary auth import|status|delete|set-url <url>|set-client-id <id>";
+const CREATE_USAGE =
+  '用法：secretary create --item ITEM [--description "用途"] --field NAME=@stdin|@owner [...] --reason "理由"';
+const UPDATE_USAGE =
+  '用法：secretary update --item ITEM (--field NAME=@stdin [...] | --rename NEW | --description "用途") --reason "理由"';
+const REMOVE_USAGE = '用法：secretary remove --item ITEM [--field NAME] --reason "理由"';
+const MAX_WRITE_FIELDS = 20;
 /** 理由必传；服务端也会硬拒空/过短，这里先拦一道是为了给调用方一个明确的报错。 */
 const MIN_REASON_LENGTH = 10;
 const MAX_REASON_LENGTH = 2000;
@@ -56,7 +62,7 @@ export function isValidFieldName(value: string): boolean {
 }
 export type Binding = { field: CatalogField; env: string };
 export type CatalogResponse = {
-  items: Array<{ name: string; description: string; fields: CatalogField[] }>;
+  items: Array<{ name: string; description: string; fields: CatalogField[]; created_at: string }>;
 };
 export type ApprovalResult = {
   approved?: boolean;
@@ -106,14 +112,30 @@ export type ClientDeps = {
   spawn: (argv: string[], cwd: string, env: Record<string, string>) => Promise<number>;
   stdout: (message: string) => void;
   stderr: (message: string) => void;
+  /** Whole stdin as text. Field values arrive here and never through argv. */
+  readStdin: () => Promise<string>;
   onInterrupt?: (handler: () => void) => () => void;
 };
 
 export type AuthAction = "import" | "status" | "delete" | "set-url" | "set-client-id";
 
 export type ExecItem = { itemName: string; bindings: Binding[] };
+export type WriteOperation = "create" | "update" | "remove";
+export type WriteFieldSpec = { name: CatalogField; source: "inline" | "owner" };
+
 export type ParsedInvocation =
   | { action: "list"; cwd: string; query: string; json: boolean }
+  | {
+    action: "write";
+    cwd: string;
+    operation: WriteOperation;
+    item: string;
+    reason: string;
+    description?: string;
+    rename?: string;
+    fields: WriteFieldSpec[];
+    removeField?: string;
+  }
   | { action: "exec"; cwd: string; items: ExecItem[]; command: string[]; reason: string }
   | { action: "auth"; cwd: string; authAction: AuthAction; value?: string };
 
@@ -203,6 +225,112 @@ export function extractReason(tokens: string[]): { reason: string; tokens: strin
   return { reason, tokens: rest };
 }
 
+/**
+ * `--field NAME=@stdin` or `NAME=@owner`.
+ *
+ * A literal value is refused by construction, not by convention: argv is
+ * visible to every process on the machine via `ps`, lands in shell history,
+ * and is echoed in the agent's own transcript. Agent-supplied values come in
+ * over stdin as JSON; Owner-supplied ones never reach the agent at all.
+ */
+export function parseWriteFieldSpec(value: string): WriteFieldSpec {
+  const separator = value.indexOf("=");
+  if (separator <= 0 || separator === value.length - 1) {
+    throw new Error(`无效 --field：${value}（写成 NAME=@stdin 或 NAME=@owner）`);
+  }
+  const name = value.slice(0, separator);
+  const source = value.slice(separator + 1);
+  if (!isValidFieldName(name)) throw new Error(`无效字段名：${name}`);
+  if (source === "@stdin") return { name, source: "inline" };
+  if (source === "@owner") return { name, source: "owner" };
+  throw new Error(
+    `--field ${name} 的值只能是 @stdin 或 @owner：明文不能出现在命令行里，` +
+    `agent 自己有的值请用 @stdin 从标准输入传 JSON`,
+  );
+}
+
+function takeFlagValue(tokens: string[], index: number, flag: string): string {
+  const value = tokens[index + 1];
+  if (value === undefined || value.startsWith("--")) throw new Error(`${flag} 缺少取值`);
+  return value;
+}
+
+export function parseWriteInvocation(
+  operation: WriteOperation,
+  cwd: string,
+  rest: string[],
+): ParsedInvocation {
+  const usage = operation === "create" ? CREATE_USAGE : operation === "update" ? UPDATE_USAGE : REMOVE_USAGE;
+  const { reason, tokens } = extractReason(rest);
+  let item: string | undefined;
+  let description: string | undefined;
+  let rename: string | undefined;
+  let removeField: string | undefined;
+  const fields: WriteFieldSpec[] = [];
+
+  for (let index = 0; index < tokens.length; index++) {
+    const flag = tokens[index];
+    switch (flag) {
+      case "--item":
+        if (item !== undefined) throw new Error("--item 只能给一次");
+        item = takeFlagValue(tokens, index++, flag).trim();
+        break;
+      case "--description":
+        if (description !== undefined) throw new Error("--description 只能给一次");
+        description = takeFlagValue(tokens, index++, flag).trim();
+        break;
+      case "--rename":
+        if (rename !== undefined) throw new Error("--rename 只能给一次");
+        rename = takeFlagValue(tokens, index++, flag).trim();
+        break;
+      case "--field": {
+        const value = takeFlagValue(tokens, index++, flag);
+        if (operation === "remove") {
+          if (removeField !== undefined) throw new Error("remove 的 --field 只能给一次");
+          if (!isValidFieldName(value)) throw new Error(`无效字段名：${value}`);
+          removeField = value;
+          break;
+        }
+        fields.push(parseWriteFieldSpec(value));
+        break;
+      }
+      default:
+        throw new Error(`未知参数：${flag}\n${usage}`);
+    }
+  }
+
+  if (!item) throw new Error(usage);
+  if (item.length > 200 || /[\u0000-\u001f\u007f]/.test(item)) throw new Error("ITEM 无效");
+  if (fields.length > MAX_WRITE_FIELDS) throw new Error(`一次最多 ${MAX_WRITE_FIELDS} 个字段`);
+  const names = new Set<string>();
+  for (const field of fields) {
+    if (names.has(field.name)) throw new Error(`字段重复：${field.name}`);
+    names.add(field.name);
+  }
+
+  if (operation === "create") {
+    if (fields.length === 0) throw new Error(`create 至少要一个 --field\n${CREATE_USAGE}`);
+    if (rename !== undefined) throw new Error("create 不接受 --rename");
+  } else if (operation === "update") {
+    // @owner is create-only: the lane that skips an Approval may only add.
+    const owner = fields.find((field) => field.source === "owner");
+    if (owner) {
+      throw new Error(
+        `@owner 只能用于 create（字段 ${owner.name}）：修改已有值必须经过审批，请改用 @stdin，` +
+        "或者自己去 vault 客户端里改。",
+      );
+    }
+    const intents = [rename !== undefined, description !== undefined, fields.length > 0].filter(Boolean).length;
+    if (intents === 0) throw new Error(UPDATE_USAGE);
+    if (intents > 1) throw new Error("update 一次只能改一类东西：字段值、条目名、描述，请分开提交");
+  } else {
+    if (fields.length > 0) throw new Error("remove 的 --field 只写字段名，不带 =");
+    if (rename !== undefined || description !== undefined) throw new Error(REMOVE_USAGE);
+  }
+
+  return { action: "write", cwd, operation, item, reason, description, rename, fields, removeField };
+}
+
 const AUTH_ACTIONS_NO_VALUE: AuthAction[] = ["import", "status", "delete"];
 const AUTH_ACTIONS_WITH_VALUE: AuthAction[] = ["set-url", "set-client-id"];
 
@@ -229,6 +357,9 @@ export function parseInvocation(args: string[]): ParsedInvocation {
     }
     throw new Error(AUTH_USAGE);
   }
+  if (action === "create" || action === "update" || action === "remove") {
+    return parseWriteInvocation(action, cwd, rest);
+  }
   if (action === "exec") {
     const separator = rest.indexOf("--");
     if (separator < 0 || separator === rest.length - 1) throw new Error(EXEC_USAGE);
@@ -238,7 +369,7 @@ export function parseInvocation(args: string[]): ParsedInvocation {
     if (command.some((part) => part.length > MAX_ARGV_ENTRY_LENGTH)) throw new Error("命令参数过长");
     return { action, cwd, items: parseItemGroups(tokens), command, reason };
   }
-  throw new Error("用法：secretary list|exec|auth ...");
+  throw new Error("用法：secretary list|exec|create|update|remove|auth ...");
 }
 
 function parseJson(text: string, context: string): unknown {
@@ -267,6 +398,7 @@ export function parseCatalogResponse(value: unknown): CatalogResponse {
       name: item.name.trim(),
       description: typeof item.description === "string" ? item.description.trim().slice(0, 1000) : "",
       fields: fields.sort(),
+      created_at: typeof item.created_at === "string" ? item.created_at.trim().slice(0, 100) : "",
     };
   });
   return { items };
@@ -616,8 +748,13 @@ async function validateApprovalResult(
 }
 
 function formatCatalog(catalog: CatalogResponse): string {
-  const headers = ["NAME", "FIELDS", "DESCRIPTION"];
-  const rows = catalog.items.map((item) => [item.name, item.fields.join(","), item.description || "-"]
+  const headers = ["NAME", "FIELDS", "DESCRIPTION", "CREATED_AT"];
+  const rows = catalog.items.map((item) => [
+    item.name,
+    item.fields.join(","),
+    item.description || "-",
+    item.created_at || "-",
+  ]
     .map((value) => value.replace(/[\u0000-\u001f\u007f]/g, " ")));
   const widths = headers.map((header, index) => Math.max(header.length, ...rows.map((row) => row[index].length)));
   return [headers, ...rows].map((row) => row.map((cell, index) => cell.padEnd(widths[index])).join("  ").trimEnd()).join("\n") + "\n";
@@ -670,6 +807,168 @@ async function runAuth(invocation: Extract<ParsedInvocation, { action: "auth" }>
   }
 }
 
+export type WriteResponse =
+  | { status: "applied"; operation: string; item: string; detail: string }
+  | { status: "unchanged"; operation: string; item: string; detail: string }
+  | { status: "pending_entry"; entry_path: string; expires_at: string; fields: string[] }
+  | { status: "rejected"; reason: "denied" | "timeout" };
+
+/** Inline values arrive as one JSON object on stdin — one shape for one and for
+ * many, so the agent never has to decide which form to use. */
+export function parseStdinValues(raw: string, expected: string[]): Record<string, string> {
+  const trimmed = raw.trim();
+  if (!trimmed) throw new Error(`需要从标准输入读取字段值 JSON：{"${expected[0]}":"…"}`);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    throw new Error("标准输入不是合法 JSON（应为 {\"字段名\":\"值\"} 对象）");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("标准输入应为 JSON 对象：{\"字段名\":\"值\"}");
+  }
+  const record = parsed as Record<string, unknown>;
+  const values: Record<string, string> = {};
+  for (const name of expected) {
+    const value = record[name];
+    if (typeof value !== "string" || value.length === 0) throw new Error(`标准输入缺少字段值：${name}`);
+    if (value.length > 65_536) throw new Error(`字段值过长：${name}`);
+    // Assignment would invoke Object.prototype.__proto__'s setter instead of
+    // creating an own property for that otherwise-valid field name.
+    Object.defineProperty(values, name, {
+      value,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+  }
+  const extra = Object.keys(record).filter((key) => !expected.includes(key));
+  // Fail closed rather than silently dropping: an unexpected key usually means
+  // a `--field` was forgotten, and quietly ignoring it would write half an item.
+  if (extra.length) throw new Error(`标准输入包含未声明的字段：${extra.join("、")}（需要对应的 --field NAME=@stdin）`);
+  return values;
+}
+
+export function parseWriteResponse(value: unknown): WriteResponse {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("secretary 返回结构无效");
+  const body = value as Record<string, unknown>;
+  const status = body.status;
+  if (status === "applied" || status === "unchanged") {
+    if (typeof body.detail !== "string" || typeof body.item !== "string" || typeof body.operation !== "string") {
+      throw new Error("secretary 返回结构无效");
+    }
+    const common = { operation: body.operation, item: body.item, detail: body.detail };
+    return status === "applied" ? { status: "applied", ...common } : { status: "unchanged", ...common };
+  }
+  if (status === "pending_entry") {
+    const path = body.entry_path;
+    const fields = body.fields;
+    if (typeof path !== "string" || !path.startsWith("/entry/") || path.length > 400) {
+      throw new Error("secretary 返回的录入链接无效");
+    }
+    if (typeof body.expires_at !== "string" || !Array.isArray(fields) || fields.some((f) => typeof f !== "string")) {
+      throw new Error("secretary 返回结构无效");
+    }
+    return { status, entry_path: path, expires_at: body.expires_at, fields: fields as string[] };
+  }
+  if (status === "rejected" && (body.reason === "denied" || body.reason === "timeout")) {
+    return { status, reason: body.reason };
+  }
+  throw new Error("secretary 返回结构无效");
+}
+
+async function runWrite(
+  invocation: Extract<ParsedInvocation, { action: "write" }>,
+  config: BrokerConfig,
+  canonicalCwd: string,
+  deps: ClientDeps,
+): Promise<number> {
+  const requestId = deps.randomUUID().toLowerCase();
+  if (!UUID.test(requestId)) throw new Error("无法生成安全 request id");
+  const inlineNames = invocation.fields.filter((field) => field.source === "inline").map((field) => field.name);
+  const values = inlineNames.length ? parseStdinValues(await deps.readStdin(), inlineNames) : undefined;
+
+  const body = {
+    request_id: requestId,
+    operation: invocation.operation,
+    item: invocation.item,
+    reason: invocation.reason,
+    repo: normalizeRepoIdentity(deps.gitRemote(canonicalCwd), canonicalCwd),
+    host: deps.hostname().slice(0, 200),
+    user: deps.username().slice(0, 200),
+    agent: "code-agent",
+    ...(invocation.description !== undefined ? { description: invocation.description } : {}),
+    ...(invocation.rename !== undefined ? { rename: invocation.rename } : {}),
+    ...(invocation.fields.length ? { fields: invocation.fields } : {}),
+    ...(values ? { values } : {}),
+    ...(invocation.removeField !== undefined ? { field: invocation.removeField } : {}),
+    ...(config.clientId ? { client_id: config.clientId } : {}),
+  };
+  if (JSON.stringify(body).length > MAX_REQUEST_BODY_BYTES) throw new Error("请求体过大");
+
+  deps.stderr("正在向 secretary 提交 vault 写入申请…");
+  let interrupted = false;
+  const operationAbort = new AbortController();
+  const removeInterruptHandler = deps.onInterrupt?.(() => {
+    interrupted = true;
+    operationAbort.abort();
+  }) ?? (() => {});
+  let raw: unknown;
+  try {
+    raw = await brokerJson(deps, config.token, new URL(`${config.url}/v1/writes`), {
+      method: "POST",
+      body,
+      timeoutMs: HEADER_TIMEOUT_MS,
+      bodyTimeoutMsFromResponse: (response) => {
+        const advertised = Number(response.headers.get("x-secretary-approval-timeout"));
+        const seconds = Number.isFinite(advertised) && advertised >= 1 && advertised <= 3600
+          ? advertised
+          : DEFAULT_APPROVAL_TIMEOUT_S;
+        return seconds * 1000 + BODY_TIMEOUT_MARGIN_MS;
+      },
+      signal: operationAbort.signal,
+      // Never resend: the write may already have landed, and a blind retry of a
+      // Create would be refused as a name collision anyway (ADR-0005).
+      onNetworkError: (error) => {
+        if (interrupted) return new Error("已中断等待审批");
+        const message = error instanceof Error ? error.message : String(error);
+        return new Error(
+          `与 secretary 的连接失败或在请求发出后中断（request_id=${requestId}）；不会自动重发。` +
+          `请先用 secretary list "${invocation.item}" 确认写入是否已经生效：${message}`,
+        );
+      },
+    });
+  } finally {
+    removeInterruptHandler();
+  }
+  if (raw && typeof raw === "object" && !Array.isArray(raw) && typeof (raw as { error?: unknown }).error === "string") {
+    throw new Error(`secretary 服务端错误：${String((raw as { error: string }).error).slice(0, 500)}`);
+  }
+
+  const result = parseWriteResponse(raw);
+  if (result.status === "applied") {
+    deps.stdout(`${result.detail}\n`);
+    return 0;
+  }
+  if (result.status === "unchanged") {
+    deps.stdout(`${result.detail}（vault 已经是目标状态，未做改动）\n`);
+    return 0;
+  }
+  if (result.status === "pending_entry") {
+    // The link is the capability (ADR-0004): show it to the human once, do not
+    // write it anywhere, and do not act as if the write has happened.
+    deps.stdout(
+      `需要 Owner 本人填写以下字段：${result.fields.join("、")}\n` +
+      `录入链接（一次性，${result.expires_at} 前有效）：\n` +
+      `${config.url}${result.entry_path}\n` +
+      `尚未写入 vault。请把链接交给本人，填完后再继续。\n`,
+    );
+    return 0;
+  }
+  deps.stderr(result.reason === "denied" ? "写入被拒绝，vault 未改动。" : "审批超时，vault 未改动。");
+  return 1;
+}
+
 export async function main(args: string[], deps: ClientDeps = defaultDeps): Promise<number> {
   let invocation: ParsedInvocation;
   try {
@@ -698,6 +997,10 @@ export async function main(args: string[], deps: ClientDeps = defaultDeps): Prom
       }));
       deps.stdout(invocation.json ? `${JSON.stringify(catalog, null, 2)}\n` : formatCatalog(catalog));
       return 0;
+    }
+
+    if (invocation.action === "write") {
+      return await runWrite(invocation, config, canonicalCwd, deps);
     }
 
     // exec: exactly ONE blocking POST carries request + approval + credentials.
@@ -895,6 +1198,7 @@ export const defaultDeps: ClientDeps = {
   },
   stdout: (message) => process.stdout.write(message),
   stderr: (message) => process.stderr.write(`${message}\n`),
+  readStdin: () => Bun.stdin.text(),
   onInterrupt: (handler) => {
     process.once("SIGINT", handler);
     process.once("SIGTERM", handler);

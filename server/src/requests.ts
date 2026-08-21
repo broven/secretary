@@ -7,6 +7,7 @@ import type { Approver, ApprovalCard, ApprovalCardItem, SightingCard } from "./a
 import { encryptCredentialEnvelope, parseClientPublicKeyJwk } from "./envelope.ts";
 import {
   commandFingerprint,
+  GrantRevokedDuringApprovalError,
   GrantStore,
   secretGrantKey,
   type SecretGrantIdentity,
@@ -324,6 +325,10 @@ export class RequestBroker {
         field: binding.field,
       }))
     );
+    // Bind any eventual Grant save to the Item/Field generations observed
+    // immediately after vault resolution. A destructive Write can advance a
+    // generation while this Request is parked for Approval.
+    const revocationSnapshot = inlineShell ? undefined : this.deps.grants.snapshotRevocations(units);
     const grantKeys = units.map((unit) => secretGrantKey(identity, unit));
     const cardItems: ApprovalCardItem[] = request.items.map((item) => ({
       name: item.name,
@@ -407,14 +412,23 @@ export class RequestBroker {
     const ttl: ApprovalTtl = inlineShell ? "once" : (isSecretGrantTtl(decision.ttl) ? decision.ttl : "1h");
     let expiresAt = leaseExpiresAt(ttl, this.now());
     if (ttl !== "once") {
-      const saved = this.deps.grants.save(
-        identity,
-        units,
-        ttl,
-        request.request_id,
-        decision.decided_by,
-        decision.decided_at,
-      );
+      let saved;
+      try {
+        saved = this.deps.grants.save(
+          identity,
+          units,
+          ttl,
+          request.request_id,
+          decision.decided_by,
+          decision.decided_at,
+          revocationSnapshot,
+        );
+      } catch (error) {
+        if (error instanceof GrantRevokedDuringApprovalError) {
+          throw new RequestError(error.message, 409);
+        }
+        throw error;
+      }
       expiresAt = saved.map((grant) => grant.expires_at).sort()[0];
       // The command just reviewed on the card must be remembered, or the next
       // fast-path hit would immediately re-notify.

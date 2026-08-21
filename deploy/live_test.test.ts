@@ -22,6 +22,7 @@ describe("live_test harness", () => {
       name: LIVE_ITEM_NAME,
       description: "secretary live Telegram test item (in-memory only)",
       fields: ["username", "password"],
+      created_at: new Date(0).toISOString(),
     }]);
     expect(await vault.catalog("live-test")).toHaveLength(1);
     expect(await vault.catalog("no-match")).toHaveLength(0);

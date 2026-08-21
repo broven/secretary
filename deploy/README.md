@@ -126,6 +126,12 @@ The token is printed once — copy it now; it is not stored in recoverable form.
 
 ## 6. Install the CLI on the agent machine
 
+The quickest path is `skills/use-approved-secrets/install.sh`, which builds the CLI and installs the
+binary, the entrypoint wrapper and the agent-facing `SKILL.md` together (pass a
+destination to override the default `~/.agents/skills/use-approved-secrets`).
+
+By hand:
+
 1. Build it: run `cli/build.sh` (produces a compiled Bun binary).
 2. Put `cli/scripts/secretary` on your `PATH`.
 3. Store the config:
@@ -149,7 +155,21 @@ command runs with `MY_TOKEN` set in its environment only.
   ambiguity, means no secrets.
 - **Envelope encryption** is end-to-end (ephemeral P-256 + HKDF + AES-GCM):
   TLS terminators, tunnels, and proxies in front of the broker never see
-  plaintext secrets.
+  plaintext secrets **on the read path**.
+- **The write path has no envelope** (ADR-0004). Values sent to `/v1/writes`,
+  and values typed into the Entry Form at `/entry/<nonce>`, are protected by
+  the transport alone. Reach the broker over a path you trust end to end — a
+  tailnet, a VPN, or TLS terminated by the broker's own ingress — and do not
+  front it with a terminating tunnel you would not trust with the values.
+- **The Entry Form link is the capability** for the one write it completes. It
+  is single-use and expires after `ENTRY_TTL_S` (default 600 s). Because
+  holding it is enough, Owner-supplied values are accepted only by `create`,
+  which can add but never overwrite or destroy.
+- **Destructive writes revoke authorization before and after mutation.** Removing
+  an Item or Field advances its durable revocation watermark on both sides of the
+  vault change, so neither an already-pending read nor one that resolves during
+  the mutation can issue a late Grant. Restoring an Item from trash does not
+  restore its Grants.
 - **Secrets as files**: every secret env accepts a `_FILE` variant; the
   docker-secrets wiring in the compose file is the documented default. Plain
   env works but leaks more easily (inspect, logs). Setting both a variable

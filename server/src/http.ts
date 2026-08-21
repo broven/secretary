@@ -1,14 +1,28 @@
-// HTTP surface: POST /v1/requests (long poll — the connection stays open until
-// decision or timeout), GET /v1/catalog, GET /healthz. Bearer token → client
-// identity via the ClientRegistry.
+// HTTP surface: POST /v1/requests and POST /v1/writes (long polls — the
+// connection stays open until decision or timeout), GET /v1/catalog,
+// GET /healthz. Bearer token → client identity via the ClientRegistry.
+//
+// One exception to the bearer gate: GET/POST /entry/<nonce>, the Entry Form.
+// Its nonce IS the capability (CONTEXT.md "Entry Form", ADR-0004) — a browser
+// has no token — so it is matched before authentication and answers with HTML.
 
+import {
+  ENTRY_HEADERS,
+  ENTRY_PATH_PREFIX,
+  renderEntryDone,
+  renderEntryFailed,
+  renderEntryGone,
+  renderEntryPage,
+} from "./entry.ts";
 import type { ClientRegistry } from "./clients.ts";
 import { RequestBroker, RequestError } from "./requests.ts";
 import type { Vault } from "./vault.ts";
+import { WriteBroker, WriteError } from "./writes.ts";
 
 export type HttpDeps = {
   clients: ClientRegistry;
   broker: RequestBroker;
+  writes: WriteBroker;
   vault: Vault;
   hostname: string;
   port: number;
@@ -119,7 +133,7 @@ function longPollResponse(
         .catch((error) => {
           // Status is already committed; deliver the error in-band. The client
           // treats a JSON body with `error` as failure (fail closed).
-          const message = error instanceof RequestError
+          const message = error instanceof RequestError || error instanceof WriteError
             ? error.message
             : (log(`request failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`),
               "internal error");
@@ -140,6 +154,90 @@ function longPollResponse(
   });
 }
 
+type BodyOutcome = { value: unknown } | { error: string; status: number };
+
+async function readJsonBody(request: Request): Promise<BodyOutcome> {
+  const lengthHeader = Number(request.headers.get("content-length") ?? 0);
+  if (lengthHeader > MAX_BODY_BYTES) return { error: "body too large", status: 413 };
+  let text: string;
+  try {
+    text = await readBodyLimited(request, MAX_BODY_BYTES);
+  } catch {
+    return { error: "body too large", status: 413 };
+  }
+  try {
+    return { value: JSON.parse(text) };
+  } catch {
+    return { error: "invalid JSON body", status: 400 };
+  }
+}
+
+async function readEntryFormLimited(request: Request): Promise<FormData> {
+  const lengthHeader = Number(request.headers.get("content-length") ?? 0);
+  if (lengthHeader > MAX_BODY_BYTES) throw new Error("body too large");
+
+  const text = await readBodyLimited(request, MAX_BODY_BYTES);
+  const contentType = request.headers.get("content-type");
+  const headers = contentType ? { "Content-Type": contentType } : undefined;
+  return new Response(text, { headers }).formData();
+}
+
+function html(status: number, body: string): Response {
+  return new Response(body, { status, headers: ENTRY_HEADERS });
+}
+
+/**
+ * The Entry Form. Unknown, expired, and already-used nonces all get the same
+ * page and the same status: telling them apart would confirm to a guesser that
+ * a nonce once existed. The nonce itself is never logged.
+ */
+async function handleEntry(
+  url: URL,
+  request: Request,
+  writes: WriteBroker,
+  log: (message: string) => void,
+): Promise<Response> {
+  const nonce = decodeURIComponent(url.pathname.slice(ENTRY_PATH_PREFIX.length));
+  if (request.method === "GET") {
+    const draft = writes.entries.find(nonce);
+    return draft ? html(200, renderEntryPage(draft)) : html(404, renderEntryGone());
+  }
+  if (request.method !== "POST") return html(405, renderEntryGone());
+
+  const found = writes.entries.find(nonce);
+  if (!found) return html(404, renderEntryGone());
+
+  let form: FormData;
+  try {
+    form = await readEntryFormLimited(request);
+  } catch {
+    return html(400, renderEntryPage(found, "表单读取失败，请重试。"));
+  }
+  const values = new Map<string, string>();
+  for (const field of found.owner_fields) {
+    const raw = form.get(`f_${field}`);
+    if (typeof raw !== "string" || raw.length === 0) {
+      // Keep the draft alive: an empty box is a slip, not a spent capability.
+      return html(400, renderEntryPage(found, `请填写 ${field}。`));
+    }
+    values.set(field, raw);
+  }
+
+  // Single use: consume before applying, so a double submit cannot write twice.
+  const draft = writes.entries.take(nonce);
+  if (!draft) return html(404, renderEntryGone());
+  try {
+    await writes.submitEntry(draft, values);
+  } catch (error) {
+    const message = error instanceof WriteError ? error.message : "写入失败，请检查服务端日志。";
+    if (!(error instanceof WriteError)) {
+      log(`entry submit failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`);
+    }
+    return html(409, renderEntryFailed(message));
+  }
+  return html(200, renderEntryDone(draft.item));
+}
+
 export function startHttpServer(deps: HttpDeps) {
   const log = deps.log ?? ((message: string) => console.log(message));
   const server = Bun.serve({
@@ -151,6 +249,10 @@ export function startHttpServer(deps: HttpDeps) {
 
       if (url.pathname === "/healthz" && request.method === "GET") {
         return json(200, { ok: true });
+      }
+
+      if (url.pathname.startsWith(ENTRY_PATH_PREFIX)) {
+        return handleEntry(url, request, deps.writes, log);
       }
 
       const token = bearerToken(request);
@@ -165,6 +267,23 @@ export function startHttpServer(deps: HttpDeps) {
           log(`catalog failed: ${error instanceof Error ? error.message : String(error)}`);
           return json(500, { error: "catalog unavailable" });
         }
+      }
+
+      if (url.pathname === "/v1/writes" && request.method === "POST") {
+        const body = await readJsonBody(request);
+        if ("error" in body) return json(body.status, { error: body.error });
+        let pending: Promise<unknown>;
+        try {
+          pending = deps.writes.handle(body.value, client);
+        } catch (error) {
+          if (error instanceof WriteError) return json(error.status, { error: error.message });
+          log(`write rejected: ${error instanceof Error ? error.message : String(error)}`);
+          return json(500, { error: "internal error" });
+        }
+        srv.timeout(request, 0);
+        return longPollResponse(pending, log, deps.approvalTimeoutMs
+          ? { [APPROVAL_TIMEOUT_HEADER]: String(Math.ceil(deps.approvalTimeoutMs / 1000)) }
+          : {});
       }
 
       if (url.pathname === "/v1/requests" && request.method === "POST") {

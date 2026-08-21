@@ -15,6 +15,9 @@ export type BrokerConfig = {
   telegram_chat_id: string;
   telegram_allowed_user_ids: number[];
   approval_timeout_s: number;
+  /** How long an Entry Form link stays usable. The link IS the capability
+   * (ADR-0004), so this window is the main thing bounding a leaked one. */
+  entry_ttl_s: number;
   sync_max_age_s: number;
   db_path: string;
   listen_addr: { hostname: string; port: number };
@@ -24,6 +27,8 @@ export type BrokerConfig = {
 export const DEFAULT_APPROVAL_TIMEOUT_S = 300;
 export const MAX_APPROVAL_TIMEOUT_S = 600;
 export const DEFAULT_SYNC_MAX_AGE_S = 60;
+export const DEFAULT_ENTRY_TTL_S = 600;
+export const MAX_ENTRY_TTL_S = 3600;
 
 export type Env = Record<string, string | undefined>;
 
@@ -137,6 +142,13 @@ export function loadConfig(env: Env = process.env): BrokerConfig {
       DEFAULT_APPROVAL_TIMEOUT_S,
       1,
       MAX_APPROVAL_TIMEOUT_S,
+    ),
+    entry_ttl_s: parseBoundedInt(
+      (env.ENTRY_TTL_S ?? "").trim(),
+      "ENTRY_TTL_S",
+      DEFAULT_ENTRY_TTL_S,
+      60,
+      MAX_ENTRY_TTL_S,
     ),
     sync_max_age_s: parseBoundedInt(
       (env.SYNC_MAX_AGE_S ?? "").trim(),

@@ -38,6 +38,7 @@ import { ClientRegistry } from "../server/src/clients.ts";
 import { GrantStore, secretGrantKey } from "../server/src/grants.ts";
 import { startHttpServer } from "../server/src/http.ts";
 import { RequestBroker } from "../server/src/requests.ts";
+import { WriteBroker } from "../server/src/writes.ts";
 import {
   resolveNamesAgainstCatalog,
   valueKey,
@@ -82,6 +83,7 @@ export function makeLiveVault(secrets: { username: string; password: string }): 
   const item: ResolvedItem = {
     item_id: LIVE_ITEM_ID,
     revision: new Date(0).toISOString(),
+    created_at: new Date(0).toISOString(),
     name: LIVE_ITEM_NAME,
     description: "secretary live Telegram test item (in-memory only)",
     fields: ["username", "password"],
@@ -94,11 +96,24 @@ export function makeLiveVault(secrets: { username: string; password: string }): 
     async catalog(query = "") {
       const normalized = query.trim().toLowerCase();
       return (!normalized || item.name.toLowerCase().includes(normalized))
-        ? [{ name: item.name, description: item.description, fields: item.fields }]
+        ? [{ name: item.name, description: item.description, fields: item.fields, created_at: item.created_at }]
         : [];
     },
     async resolveByName(names: string[]) {
       return resolveNamesAgainstCatalog(names, [item]);
+    },
+    // The live Telegram harness exercises the read path only.
+    async findItemsByName() {
+      throw new Error("live vault: read-only");
+    },
+    async createItem() {
+      throw new Error("live vault: read-only");
+    },
+    async replaceItem() {
+      throw new Error("live vault: read-only");
+    },
+    async trashItem() {
+      throw new Error("live vault: read-only");
     },
     async readValues(units: Array<{ item_id: string; field: SecretField }>) {
       const out = new Map<string, string>();
@@ -212,9 +227,18 @@ async function main(): Promise<void> {
     approvalTimeoutMs: OWNER_PATIENCE_MS,
     log: (message) => say(`broker: ${message}`),
   });
+  const writes = new WriteBroker({
+    vault,
+    grants,
+    approver,
+    approvalTimeoutMs: OWNER_PATIENCE_MS,
+    entryTtlMs: OWNER_PATIENCE_MS,
+    log: (message) => say(`broker: ${message}`),
+  });
   const server = startHttpServer({
     clients,
     broker,
+    writes,
     vault,
     hostname: "127.0.0.1",
     port: 0,

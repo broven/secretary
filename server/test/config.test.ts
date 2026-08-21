@@ -57,9 +57,16 @@ describe("loadConfig", () => {
     expect(config.telegram_allowed_user_ids).toEqual([42, 43]);
     expect(config.approval_timeout_s).toBe(300);
     expect(config.sync_max_age_s).toBe(60);
+    expect(config.entry_ttl_s).toBe(600);
     expect(config.db_path).toBe("/data/secretary.sqlite");
     expect(config.listen_addr).toEqual({ hostname: "0.0.0.0", port: 8787 });
     expect(config.dev_auto_approve).toBe(false);
+  });
+
+  test("ENTRY_TTL_S is bounded: a long-lived entry link is a long-lived capability", () => {
+    expect(loadConfig({ ...BASE_ENV, ENTRY_TTL_S: "120" }).entry_ttl_s).toBe(120);
+    expect(() => loadConfig({ ...BASE_ENV, ENTRY_TTL_S: "1" })).toThrow("ENTRY_TTL_S");
+    expect(() => loadConfig({ ...BASE_ENV, ENTRY_TTL_S: "99999" })).toThrow("ENTRY_TTL_S");
   });
 
   test("requires telegram settings unless dev auto approve is on", () => {

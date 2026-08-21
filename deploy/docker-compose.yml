@@ -31,9 +31,12 @@ services:
       BW_EMAIL: ${BW_EMAIL}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
       TELEGRAM_ALLOWED_USER_IDS: ${TELEGRAM_ALLOWED_USER_IDS}
-      # Optional tuning; empty means the broker defaults (300 / 60).
+      # Optional tuning; empty means the broker defaults (300 / 60 / 600).
       APPROVAL_TIMEOUT_S: ${APPROVAL_TIMEOUT_S:-}
       SYNC_MAX_AGE_S: ${SYNC_MAX_AGE_S:-}
+      # How long a one-time Entry Form link stays usable. The link IS the
+      # capability to complete that one write, so keep this short.
+      ENTRY_TTL_S: ${ENTRY_TTL_S:-}
       # Secrets come from docker secrets via _FILE variants (default).
       BW_CLIENTID_FILE: /run/secrets/bw_clientid
       BW_CLIENTSECRET_FILE: /run/secrets/bw_clientsecret
