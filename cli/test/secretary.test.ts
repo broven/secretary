@@ -67,8 +67,18 @@ async function encryptForClient(
 
 const CATALOG_RESPONSE = {
   items: [
-    { name: "Example API", description: "给测试命令使用", fields: ["password"] },
-    { name: "Other API", description: "第二个测试条目", fields: ["password", "username"] },
+    {
+      name: "Example API",
+      description: "给测试命令使用",
+      fields: ["password"],
+      created_at: "2026-08-21T08:09:10.000Z",
+    },
+    {
+      name: "Other API",
+      description: "第二个测试条目",
+      fields: ["password", "username"],
+      created_at: "2025-01-02T03:04:05.000Z",
+    },
   ],
 };
 
@@ -80,6 +90,7 @@ type MakeDepsOptions = {
   requestResult?: unknown;
   envelopeRequestId?: string;
   resultExtras?: Record<string, unknown>;
+  stdinText?: string;
 };
 
 function makeDeps(options: MakeDepsOptions = {}) {
@@ -105,6 +116,7 @@ function makeDeps(options: MakeDepsOptions = {}) {
     promptWrite: async () => {},
     delete: async (service) => { delete keychainValues[service]; },
   };
+  const stdinText = options.stdinText ?? "";
   const deps: ClientDeps = {
     env: {
       HOME: "/Users/test",
@@ -171,6 +183,7 @@ function makeDeps(options: MakeDepsOptions = {}) {
     },
     stdout: (message) => stdout.push(message),
     stderr: (message) => stderr.push(message),
+    readStdin: async () => stdinText,
   };
   return { deps, stdout, stderr, requests, spawns, keychainValues };
 }
@@ -284,6 +297,7 @@ describe("self-contained secretary client", () => {
       name: "Example API",
       description: "给测试命令使用",
       fields: ["password"],
+      created_at: "2026-08-21T08:09:10.000Z",
     });
     expect(JSON.stringify(parseCatalogResponse(CATALOG_RESPONSE))).not.toContain("must-never-leak");
     // Custom field names are now legal catalog fields…
@@ -293,6 +307,22 @@ describe("self-contained secretary client", () => {
     expect(() => parseCatalogResponse({ items: [{ name: "X", fields: ["a=b"] }] })).toThrow();
     expect(() => parseCatalogResponse({ items: [{ name: "X", fields: ["a,b"] }] })).toThrow();
     expect(() => parseCatalogResponse({ items: "no" })).toThrow();
+  });
+
+  test("preserves catalog creation times for lost-create recovery", () => {
+    expect(parseCatalogResponse({
+      items: [{
+        name: "Example API",
+        description: "给测试命令使用",
+        fields: ["password"],
+        created_at: "2026-08-21T08:09:10.000Z",
+      }],
+    }).items[0]).toEqual({
+      name: "Example API",
+      description: "给测试命令使用",
+      fields: ["password"],
+      created_at: "2026-08-21T08:09:10.000Z",
+    });
   });
 
   test("restores caller PATH and strips all broker controls from the final child", () => {
@@ -430,6 +460,8 @@ describe("self-contained secretary client", () => {
     expect(table).toContain("NAME");
     expect(table).toContain("FIELDS");
     expect(table).toContain("DESCRIPTION");
+    expect(table).toContain("CREATED_AT");
+    expect(table).toContain("2026-08-21T08:09:10.000Z");
     expect(table).toContain("Example API");
     expect(table).toContain("password,username");
     expect(table).not.toContain("env-token");
@@ -441,8 +473,18 @@ describe("self-contained secretary client", () => {
     expect(context.requests[0].path).toBe("/v1/catalog");
     expect(JSON.parse(context.stdout.join(""))).toEqual({
       items: [
-        { name: "Example API", description: "给测试命令使用", fields: ["password"] },
-        { name: "Other API", description: "第二个测试条目", fields: ["password", "username"] },
+        {
+          name: "Example API",
+          description: "给测试命令使用",
+          fields: ["password"],
+          created_at: "2026-08-21T08:09:10.000Z",
+        },
+        {
+          name: "Other API",
+          description: "第二个测试条目",
+          fields: ["password", "username"],
+          created_at: "2025-01-02T03:04:05.000Z",
+        },
       ],
     });
   });

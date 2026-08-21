@@ -90,12 +90,37 @@ docker exec <broker> bun run /app/server/src/cli_admin.ts client add my-mac
 # prints client_id + token, shown exactly once
 ```
 
+On the agent machine, one command builds the CLI, installs the agent-facing
+skill, and puts `approved-secret` on your PATH (requires [bun](https://bun.sh)):
+
 ```sh
-cd cli && ./build.sh            # bun test + compiled single binary
-secretary auth set-url https://secretary.example.com
-secretary auth set-client-id <client_id>
-secretary auth import           # prompts for the token → macOS Keychain
+curl -fsSL https://raw.githubusercontent.com/broven/secretary/main/install.sh | sh
 ```
+
+Prefer to read before you run — it is a shell script from the internet:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/broven/secretary/main/install.sh -o install.sh
+less install.sh && sh install.sh
+```
+
+It installs into `~/.agents/skills/use-approved-secrets/` and links
+`~/.local/bin/approved-secret`; override with `SECRETARY_SKILL_DIR` /
+`SECRETARY_BIN_DIR`. From a checkout, `sh install.sh` does the same without
+downloading anything.
+
+Then the two bootstrap steps, which are yours alone — a token must never be
+pasted into an agent's conversation:
+
+```sh
+approved-secret auth set-url https://secretary.example.com
+approved-secret auth set-client-id <client_id>
+approved-secret auth import     # prompts for the token → macOS Keychain
+```
+
+The skill alone (documentation, no CLI) can also be pulled with
+`npx skills add broven/secretary --skill use-approved-secrets`, but the
+contract it describes needs the compiled binary above to be of any use.
 
 On Linux, `SECRETARY_URL` / `SECRETARY_TOKEN` env vars replace the Keychain.
 

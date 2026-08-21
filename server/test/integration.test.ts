@@ -13,20 +13,40 @@ import { TelegramApprover } from "../src/approver_telegram.ts";
 import { createAutoApprover } from "../src/approver_auto.ts";
 import type { ResolvedItem, SecretField, Vault } from "../src/vault.ts";
 import { resolveNamesAgainstCatalog, valueKey } from "../src/vault.ts";
+import { WriteBroker } from "../src/writes.ts";
 import { startFakeTelegram, type FakeTelegram } from "./helpers/fake_telegram.ts";
 
 const OWNER = 42;
 
+type FakeItem =
+  & Omit<ResolvedItem, "created_at">
+  & { created_at?: string; values: Partial<Record<SecretField, string>> };
+
 class FakeVault implements Vault {
   syncCount = 0;
-  constructor(
-    private readonly items: Array<ResolvedItem & { values: Partial<Record<SecretField, string>> }>,
-  ) {}
+  private readonly items: Array<ResolvedItem & { values: Partial<Record<SecretField, string>> }>;
+  constructor(items: FakeItem[]) {
+    this.items = items.map((item) => ({ created_at: item.revision, ...item }));
+  }
   async catalog(query = "") {
     const normalized = query.trim().toLowerCase();
     return this.items
       .filter((item) => !normalized || item.name.toLowerCase().includes(normalized))
-      .map(({ name, description, fields }) => ({ name, description, fields }));
+      .map(({ name, description, fields, created_at }) => ({ name, description, fields, created_at }));
+  }
+  // These read-path tests never write; the write surface exists only to satisfy
+  // the Vault contract, and is loud if a test reaches it by accident.
+  async findItemsByName(): Promise<never> {
+    throw new Error("fake vault: read-only");
+  }
+  async createItem(): Promise<never> {
+    throw new Error("fake vault: read-only");
+  }
+  async replaceItem(): Promise<never> {
+    throw new Error("fake vault: read-only");
+  }
+  async trashItem(): Promise<never> {
+    throw new Error("fake vault: read-only");
   }
   async resolveByName(names: string[]) {
     return resolveNamesAgainstCatalog(names, this.items);
@@ -96,9 +116,18 @@ async function startStack(options: { approvalTimeoutMs?: number } = {}): Promise
     approvalTimeoutMs: options.approvalTimeoutMs ?? 5_000,
     log: () => {},
   });
+  const writes = new WriteBroker({
+    vault,
+    grants,
+    approver,
+    approvalTimeoutMs: options.approvalTimeoutMs ?? 5_000,
+    entryTtlMs: 60_000,
+    log: () => {},
+  });
   const server = startHttpServer({
     clients,
     broker,
+    writes,
     vault,
     hostname: "127.0.0.1",
     port: 0,
@@ -519,7 +548,23 @@ describe("broker integration (fake telegram + fake vault)", () => {
     })).toThrow();
     const approver = createAutoApprover({ env: { SECRETARY_DEV_AUTO_APPROVE: "1" }, log: () => {} });
     const broker = new RequestBroker({ vault, grants, approver, approvalTimeoutMs: 2_000, log: () => {} });
-    const server = startHttpServer({ clients, broker, vault, hostname: "127.0.0.1", port: 0, log: () => {} });
+    const writes = new WriteBroker({
+      vault,
+      grants,
+      approver,
+      approvalTimeoutMs: 2_000,
+      entryTtlMs: 60_000,
+      log: () => {},
+    });
+    const server = startHttpServer({
+      clients,
+      broker,
+      writes,
+      vault,
+      hostname: "127.0.0.1",
+      port: 0,
+      log: () => {},
+    });
     cleanups.push(() => server.stop(true));
     const keys = await clientKeys();
     const body = requestBody({

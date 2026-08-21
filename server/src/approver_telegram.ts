@@ -17,6 +17,10 @@ import type {
   ApprovalDecision,
   Approver,
   SightingCard,
+  WriteCard,
+  WriteCardKind,
+  WriteDecision,
+  WriteNote,
 } from "./approver.ts";
 import { isSecretGrantTtl, type ApprovalTtl } from "./types.ts";
 
@@ -99,6 +103,32 @@ function renderCardText(subject: string, summary: string, fields: CardField[], f
 export const TELEGRAM_MESSAGE_LIMIT = 3900;
 /** An approval card may span at most this many messages before failing closed. */
 export const MAX_APPROVAL_MESSAGES = 4;
+/** Escaped HTML budget for one decision-critical value block. */
+const COMPLETE_VALUE_CHUNK_LIMIT = 3000;
+
+/** Split before escaping so an HTML entity is never cut across messages. */
+function escapeCompleteValue(value: unknown): string[] {
+  const chunks: string[] = [];
+  let current = "";
+  for (const character of String(value ?? "")) {
+    const escaped = escapeHtml(character);
+    if (current && current.length + escaped.length > COMPLETE_VALUE_CHUNK_LIMIT) {
+      chunks.push(current);
+      current = "";
+    }
+    current += escaped;
+  }
+  chunks.push(current);
+  return chunks;
+}
+
+function completeValueBlocks(label: string, value: unknown, monospace: boolean): string[] {
+  return escapeCompleteValue(value).map((chunk, index) => {
+    const renderedLabel = index === 0 ? label : `${label}（续 ${index + 1}）`;
+    const renderedValue = monospace ? `<code>${chunk}</code>` : chunk;
+    return `<b>${escapeHtml(renderedLabel)}</b>: ${renderedValue}`;
+  });
+}
 
 /**
  * Render the approval card COMPLETELY: every item, every field → env mapping,
@@ -161,6 +191,91 @@ export function buildApprovalMessages(card: ApprovalCard): string[] {
     throw new Error("approval card cannot be rendered completely; rejecting the request");
   }
   return messages;
+}
+
+const WRITE_CARD_TITLES: Readonly<Record<WriteCardKind, string>> = {
+  create_item: "新建条目",
+  create_field: "新增字段",
+  update_value: "改字段值",
+  update_rename: "改条目名",
+  update_description: "改条目描述",
+  remove_item: "删除条目",
+  remove_field: "删除字段",
+};
+
+/**
+ * Render a Write Approval card COMPLETELY or throw. Same contract as
+ * buildApprovalMessages: the Owner must never be asked to approve a card that
+ * hides part of what it changes. Values never appear — the caller has already
+ * reduced every secret to a Fingerprint.
+ */
+export function buildWriteMessages(card: WriteCard): string[] {
+  const title = WRITE_CARD_TITLES[card.kind] ?? "写入";
+  const header = [
+    `🔑 <b>${escapeHtml(limit(`vault 写入审批 · ${title}`, 180))}</b>`,
+    ...(card.reason ? [escapeHtml(limit(card.reason, 400))] : []),
+  ].join("\n");
+  const footer = `<i>审批截止：${escapeHtml(card.expires_at)} · 本次写入不会产生任何免审授权。</i>`;
+
+  const blocks: string[] = completeValueBlocks("条目", card.item, true);
+  for (const line of card.lines) {
+    blocks.push(...completeValueBlocks(line.label || "详情", line.value, !line.plain));
+  }
+  for (const warning of card.warnings) {
+    blocks.push(...completeValueBlocks("⚠️ 注意", warning, false));
+  }
+  blocks.push([
+    `<b>仓库</b>: <code>${escapeHtml(limit(card.repo, FIELD_VALUE_LIMIT))}</code>`,
+    `<b>来源</b>: <code>${escapeHtml(limit([card.host, card.user, card.agent].filter(Boolean).join(" · "), FIELD_VALUE_LIMIT))}</code>`,
+    ...(card.client_name ? [`<b>客户端</b>: <code>${escapeHtml(limit(card.client_name, FIELD_VALUE_LIMIT))}</code>`] : []),
+  ].join("\n"));
+
+  const messages: string[] = [];
+  let current = header;
+  const flush = () => {
+    messages.push(current);
+    current = `🔑 <b>${escapeHtml(limit(`vault 写入审批（续 ${messages.length + 1}）`, 180))}</b>`;
+  };
+  for (const block of blocks) {
+    if (block.length > TELEGRAM_MESSAGE_LIMIT) {
+      throw new Error("write card cannot be rendered completely; rejecting the request");
+    }
+    if (current.length + 2 + block.length > TELEGRAM_MESSAGE_LIMIT) flush();
+    current += `\n\n${block}`;
+  }
+  if (current.length + 2 + footer.length > TELEGRAM_MESSAGE_LIMIT) flush();
+  current += `\n\n${footer}`;
+  messages.push(current);
+  if (messages.length > MAX_APPROVAL_MESSAGES) {
+    throw new Error("write card cannot be rendered completely; rejecting the request");
+  }
+  return messages;
+}
+
+export function buildWriteKeyboard(callbackToken: string): TelegramInlineKeyboard {
+  return buttonRows([
+    { text: `${actionEmoji("primary")} 确认写入`, callback_data: callbackData(`wr:${callbackToken}:apply`) },
+    { text: `${actionEmoji("danger")} 拒绝`, callback_data: callbackData(`wr:${callbackToken}:deny`) },
+  ]);
+}
+
+export function buildWriteNoteText(note: WriteNote): string {
+  const fields: CardField[] = [
+    ...note.lines.map((line) => ({
+      label: line.label,
+      value: line.value,
+      monospace: !line.plain,
+    })),
+    { label: "仓库", value: note.repo },
+    { label: "来源", value: [note.host, note.user, note.agent].filter(Boolean).join(" · ") },
+    ...(note.client_name ? [{ label: "客户端", value: note.client_name }] : []),
+  ].filter((field) => field.value);
+  return renderCardText(
+    note.headline,
+    "",
+    fields,
+    "<i>这条通知是记录，不需要你操作；如果不是你预期的写入，请到 vault 里核对。</i>",
+  );
 }
 
 export function buildSightingText(card: SightingCard): string {
@@ -271,6 +386,12 @@ type PendingApproval = {
   inlineShell: boolean;
 };
 
+type PendingWrite = {
+  resolve: (decision: WriteDecision) => void;
+  timer: ReturnType<typeof setTimeout>;
+  requestId: string;
+};
+
 export type TelegramApproverConfig = {
   botToken: string;
   chatId: string;
@@ -305,6 +426,10 @@ export class TelegramApprover implements Approver {
   private readonly now: () => number;
 
   private readonly pending = new Map<string, PendingApproval>();
+  /** Server-generated callback token -> pending write. */
+  private readonly pendingWrites = new Map<string, PendingWrite>();
+  /** Caller request id -> pending write, used only to reject concurrent reuse. */
+  private readonly pendingWriteRequestIds = new Map<string, PendingWrite>();
   private abortController: AbortController | null = null;
   private offset = 0;
 
@@ -344,6 +469,12 @@ export class TelegramApprover implements Approver {
       entry.resolve({ approved: false, reason: "timeout" });
       this.pending.delete(id);
     }
+    for (const [token, entry] of this.pendingWrites) {
+      clearTimeout(entry.timer);
+      entry.resolve({ approved: false, reason: "timeout" });
+      this.pendingWrites.delete(token);
+    }
+    this.pendingWriteRequestIds.clear();
   }
 
   async requestApproval(card: ApprovalCard, timeoutMs: number): Promise<ApprovalDecision> {
@@ -385,6 +516,67 @@ export class TelegramApprover implements Approver {
       }
     }
     return decision;
+  }
+
+  async requestWriteApproval(card: WriteCard, timeoutMs: number): Promise<WriteDecision> {
+    // request_id is caller-controlled. Never replace an existing entry: doing
+    // so would let the first card's callback resolve a different Write Request.
+    if (this.pendingWriteRequestIds.has(card.id)) {
+      throw new Error("duplicate pending write request id");
+    }
+    // Telegram buttons must never carry the caller-controlled request id. A
+    // fresh server token keeps an expired card from targeting a later request
+    // that reuses that id, while remaining well below callback_data's 64 bytes.
+    const callbackToken = crypto.randomUUID();
+    // Same shape as requestApproval: park and arm the deadline BEFORE sending,
+    // so a stalled sendMessage can never extend the window.
+    let entry: PendingWrite;
+    const decision = new Promise<WriteDecision>((resolve) => {
+      const timer = setTimeout(() => {
+        if (this.pendingWrites.get(callbackToken) === entry) {
+          this.pendingWrites.delete(callbackToken);
+          this.pendingWriteRequestIds.delete(card.id);
+        }
+        resolve({ approved: false, reason: "timeout" });
+      }, timeoutMs);
+      entry = { resolve, timer, requestId: card.id };
+      this.pendingWrites.set(callbackToken, entry);
+      this.pendingWriteRequestIds.set(card.id, entry);
+    });
+    try {
+      const texts = buildWriteMessages(card);
+      for (let index = 0; index < texts.length; index++) {
+        await this.api("sendMessage", {
+          chat_id: this.chatId,
+          text: texts[index],
+          parse_mode: "HTML",
+          disable_web_page_preview: true,
+          ...(index === texts.length - 1 ? { reply_markup: buildWriteKeyboard(callbackToken) } : {}),
+        }, AbortSignal.timeout(Math.min(timeoutMs, 30_000)));
+      }
+    } catch (error) {
+      if (this.pendingWrites.get(callbackToken) === entry!) {
+        clearTimeout(entry!.timer);
+        this.pendingWrites.delete(callbackToken);
+        this.pendingWriteRequestIds.delete(card.id);
+        throw error;
+      }
+    }
+    return decision;
+  }
+
+  async notifyWrite(note: WriteNote): Promise<void> {
+    try {
+      await this.api("sendMessage", {
+        chat_id: this.chatId,
+        text: buildWriteNoteText(note),
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      });
+    } catch (error) {
+      // Best-effort by contract: an audit note never blocks a write.
+      this.log(`telegram write notification failed: ${errorMessage(error)}`);
+    }
   }
 
   async notifySighting(card: SightingCard): Promise<void> {
@@ -436,6 +628,8 @@ export class TelegramApprover implements Approver {
 
     if (data.startsWith("ap:")) {
       await this.handleApprovalCallback(data, callbackId, fromId, callback);
+    } else if (data.startsWith("wr:")) {
+      await this.handleWriteCallback(data, callbackId, fromId, callback);
     } else if (data.startsWith("rv:")) {
       await this.handleRevokeCallback(data.slice(3), callbackId, fromId, callback);
     }
@@ -470,6 +664,42 @@ export class TelegramApprover implements Approver {
     this.pending.delete(cardId);
     entry.resolve(decision);
     await this.answerCallback(callbackId, decision.approved ? "已批准" : "已拒绝");
+    await this.removeKeyboard(callback);
+  }
+
+  private async handleWriteCallback(
+    data: string,
+    callbackId: string,
+    fromId: number,
+    callback: TelegramCallbackQuery,
+  ): Promise<void> {
+    const parts = data.split(":");
+    if (parts.length !== 3) return;
+    const [, callbackToken, actionKey] = parts;
+    const entry = this.pendingWrites.get(callbackToken);
+    if (!entry) {
+      await this.answerCallback(callbackId, "已处理");
+      return;
+    }
+    if (!this.allowedUserIds.includes(fromId)) {
+      await this.answerCallback(callbackId, "无权审批");
+      return;
+    }
+    if (actionKey !== "apply" && actionKey !== "deny") {
+      await this.answerCallback(callbackId, "未知操作");
+      return;
+    }
+    clearTimeout(entry.timer);
+    this.pendingWrites.delete(callbackToken);
+    this.pendingWriteRequestIds.delete(entry.requestId);
+    entry.resolve(
+      actionKey === "apply"
+        ? { approved: true, decided_by: String(fromId), decided_at: new Date(this.now()).toISOString() }
+        : { approved: false, reason: "denied" },
+    );
+    // This callback records only the Owner's decision. The vault mutation runs
+    // after the promise resolves and may still fail, so do not claim success.
+    await this.answerCallback(callbackId, actionKey === "apply" ? "已批准，等待写入" : "已拒绝");
     await this.removeKeyboard(callback);
   }
 

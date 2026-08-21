@@ -4,10 +4,22 @@ import {
   assertSecretGrantKey,
   commandFingerprint,
   commandSightingKey,
+  GrantRevokedDuringApprovalError,
   GrantStore,
   type SecretGrantIdentity,
   secretGrantKey,
 } from "../src/grants.ts";
+import { RequestBroker } from "../src/requests.ts";
+import type {
+  ApprovalCard,
+  ApprovalDecision,
+  Approver,
+  SightingCard,
+  WriteCard,
+  WriteDecision,
+  WriteNote,
+} from "../src/approver.ts";
+import type { SecretField, Vault } from "../src/vault.ts";
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
@@ -21,6 +33,7 @@ const identity: SecretGrantIdentity = {
 const unitA = { item_id: "item-aaaa-0001", field: "password" as const };
 const unitB = { item_id: "item-bbbb-0002", field: "username" as const };
 const unitC = { item_id: "item-cccc-0003", field: "password" as const };
+const unitAUsername = { item_id: unitA.item_id, field: "username" as const };
 
 const APPROVAL_ID = "approval_12345678";
 
@@ -136,6 +149,56 @@ describe("GrantStore", () => {
     test("revoking a missing key returns 0", () => {
       expect(store.revoke([secretGrantKey(identity, unitC)])).toBe(0);
     });
+
+    test("an item revocation rejects every grant issuance that captured the older watermark", () => {
+      const snapshot = store.snapshotRevocations([unitA, unitAUsername]);
+
+      store.revokeForItem(unitA.item_id);
+
+      expect(() => store.save(
+        identity,
+        [unitA, unitAUsername],
+        "8h",
+        APPROVAL_ID,
+        undefined,
+        undefined,
+        snapshot,
+      )).toThrow(GrantRevokedDuringApprovalError);
+      expect(store.activeForItem(unitA.item_id)).toHaveLength(0);
+    });
+
+    test("a field revocation is durable, atomic across a multi-unit save, and permits a fresh approval", () => {
+      const snapshot = store.snapshotRevocations([unitA, unitAUsername]);
+      store.revokeForItem(unitA.item_id, unitA.field);
+
+      // A restarted broker sees the same watermark. If one unit is stale, the
+      // approval must not partially grant the unaffected unit.
+      const restarted = new GrantStore(db, clock.now);
+      expect(() => restarted.save(
+        identity,
+        [unitAUsername, unitA],
+        "8h",
+        APPROVAL_ID,
+        undefined,
+        undefined,
+        snapshot,
+      )).toThrow(GrantRevokedDuringApprovalError);
+      expect(restarted.activeForItem(unitA.item_id)).toHaveLength(0);
+
+      // A request begun after the removal (including after field recreation)
+      // captures the new generation and can be approved normally.
+      const fresh = restarted.snapshotRevocations([unitA]);
+      restarted.save(
+        identity,
+        [unitA],
+        "8h",
+        "approval_87654321",
+        undefined,
+        undefined,
+        fresh,
+      );
+      expect(restarted.activeForItem(unitA.item_id, unitA.field)).toHaveLength(1);
+    });
   });
 
   describe("sightings", () => {
@@ -180,6 +243,87 @@ describe("GrantStore", () => {
       expect(count?.n).toBe(0);
     });
   });
+});
+
+test("a read resolved between destructive revocations cannot save its approved grant", async () => {
+  const db = new Database(":memory:");
+  const grants = new GrantStore(db);
+  let decide!: (decision: ApprovalDecision) => void;
+  const parked = new Promise<ApprovalDecision>((resolve) => {
+    decide = resolve;
+  });
+  let cardDelivered!: () => void;
+  const delivered = new Promise<void>((resolve) => {
+    cardDelivered = resolve;
+  });
+  const approver: Approver = {
+    requestApproval(_card: ApprovalCard): Promise<ApprovalDecision> {
+      cardDelivered();
+      return parked;
+    },
+    async notifySighting(_card: SightingCard): Promise<void> {},
+    async requestWriteApproval(_card: WriteCard): Promise<WriteDecision> {
+      throw new Error("not used");
+    },
+    async notifyWrite(_note: WriteNote): Promise<void> {},
+    start() {},
+    stop() {},
+  };
+  const vault: Vault = {
+    async catalog() {
+      return [];
+    },
+    async resolveByName() {
+      return [{
+        item_id: unitA.item_id,
+        revision: "2030-01-01T00:00:00.000Z",
+        created_at: "2030-01-01T00:00:00.000Z",
+        name: "Example API",
+        description: "test item",
+        fields: [unitA.field],
+      }];
+    },
+    async readValues(units: Array<{ item_id: string; field: SecretField }>) {
+      return new Map(units.map((unit) => [`${unit.item_id}\0${unit.field}`, "secret"]));
+    },
+    async findItemsByName() {
+      throw new Error("not used");
+    },
+    async createItem() {
+      throw new Error("not used");
+    },
+    async replaceItem() {
+      throw new Error("not used");
+    },
+    async trashItem() {
+      throw new Error("not used");
+    },
+  };
+  const broker = new RequestBroker({ vault, grants, approver, approvalTimeoutMs: 1_000, log: () => {} });
+  const pair = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
+  const publicKey = await crypto.subtle.exportKey("jwk", pair.publicKey);
+  // The destructive write revoked existing Grants, but its external vault
+  // mutation has not completed yet, so this read can still resolve the Item.
+  grants.revokeForItem(unitA.item_id);
+  const pending = broker.handle({
+    request_id: "11111111-2222-4333-8444-555555555555",
+    reason: "exercise the pending approval revocation race",
+    repo: identity.repo,
+    host: "test-host",
+    user: "test-user",
+    command_argv: ["deploy-tool"],
+    items: [{ name: "Example API", bindings: [{ field: unitA.field, env: "EXAMPLE_TOKEN" }] }],
+    client_public_key_jwk: publicKey,
+  }, { client_id: identity.client_id, name: identity.caller_id });
+
+  await delivered;
+  // The vault mutation completed. Its closing revocation must invalidate the
+  // generation captured by the read while the Item was still visible.
+  grants.revokeForItem(unitA.item_id);
+  decide({ approved: true, ttl: "8h", decided_at: "2030-01-01T00:00:00.000Z" });
+
+  await expect(pending).rejects.toThrow("审批期间");
+  expect(grants.activeForItem(unitA.item_id)).toHaveLength(0);
 });
 
 describe("key functions", () => {

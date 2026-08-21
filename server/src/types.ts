@@ -92,3 +92,62 @@ export const ENV_NAME = /^[A-Z][A-Z0-9_]*$/;
 export function isReservedSecretEnv(name: string): boolean {
   return RESERVED_ENV.has(name) || RESERVED_ENV_PREFIXES.some((prefix) => name.startsWith(prefix));
 }
+
+// ---------------------------------------------------------------------------
+// Write path (CONTEXT.md "Write Request" / "Write Operation" / "Field Source")
+// ---------------------------------------------------------------------------
+
+export type WriteOperation = "create" | "update" | "remove";
+
+/** Where a Field's value comes from. "owner" is confined to create (ADR-0004). */
+export type WriteFieldSource = "inline" | "owner";
+export type WireWriteField = { name: SecretField; source: WriteFieldSource };
+
+/** POST /v1/writes body. Inline values live in `values`, never in the field list. */
+export type WriteRequestBody = {
+  request_id: string;
+  operation: WriteOperation;
+  /** Item name, matched exactly. */
+  item: string;
+  reason: string;
+  repo: string;
+  host: string;
+  user: string;
+  agent?: string;
+  client_id?: string;
+  /**
+   * create: present iff the caller intends a NEW Item, and then required —
+   * its presence is what distinguishes "make item X" from "add a field to the
+   * existing item X". update: the Item's new Description.
+   */
+  description?: string;
+  /** update only: the Item's new name. */
+  rename?: string;
+  /** create: Fields to add. update: Fields whose value changes. */
+  fields?: WireWriteField[];
+  /** Values for every field whose source is "inline". Never logged or echoed. */
+  values?: Record<string, string>;
+  /** remove only: the Field to drop; absent means the whole Item. */
+  field?: SecretField;
+};
+
+export type WriteResult =
+  /** The vault changed. */
+  | { status: "applied"; operation: WriteOperation; item: string; detail: string }
+  /** The vault already held the requested state; the Owner was not disturbed. */
+  | { status: "unchanged"; operation: WriteOperation; item: string; detail: string }
+  /** Owner-supplied values are outstanding; the Entry Form link completes it. */
+  | { status: "pending_entry"; entry_path: string; expires_at: string; fields: SecretField[] }
+  | { status: "rejected"; reason: "denied" | "timeout" };
+
+export const MAX_WRITE_FIELDS = 20;
+export const MAX_FIELD_VALUE_LENGTH = 65_536;
+export const MAX_ITEM_NAME_LENGTH = 500;
+export const MAX_DESCRIPTION_LENGTH = 1_000;
+export const MIN_DESCRIPTION_LENGTH = 10;
+
+export const WRITE_OPERATIONS: readonly WriteOperation[] = ["create", "update", "remove"];
+
+export function isWriteOperation(value: unknown): value is WriteOperation {
+  return typeof value === "string" && (WRITE_OPERATIONS as readonly string[]).includes(value);
+}

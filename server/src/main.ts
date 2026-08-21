@@ -11,6 +11,7 @@ import { loadConfig } from "./config.ts";
 import { GrantStore } from "./grants.ts";
 import { startHttpServer } from "./http.ts";
 import { RequestBroker } from "./requests.ts";
+import { WriteBroker } from "./writes.ts";
 import { BwVault } from "./vault.ts";
 
 // Process-level guard: a per-request failure (e.g. a stream controller racing
@@ -70,9 +71,19 @@ async function main(): Promise<void> {
     log,
   });
 
+  const writes = new WriteBroker({
+    vault,
+    grants,
+    approver,
+    approvalTimeoutMs: config.approval_timeout_s * 1000,
+    entryTtlMs: config.entry_ttl_s * 1000,
+    log,
+  });
+
   startHttpServer({
     clients,
     broker,
+    writes,
     vault,
     hostname: config.listen_addr.hostname,
     port: config.listen_addr.port,
@@ -80,14 +91,20 @@ async function main(): Promise<void> {
     log,
   });
 
-  // Periodic hygiene: expired grants and stale sightings.
+  // Periodic hygiene: expired grants, stale sightings, and Entry drafts whose
+  // link was never used (the sweep is what fires their expiry notification).
   setInterval(() => {
     try {
       grants.sweep();
     } catch (error) {
       log(`grant sweep failed: ${error instanceof Error ? error.message : String(error)}`);
     }
-  }, 10 * 60 * 1000);
+    try {
+      writes.entries.sweep();
+    } catch (error) {
+      log(`entry sweep failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }, 60 * 1000);
 }
 
 main().catch((error) => {

@@ -4,7 +4,15 @@
 // a non-production NODE_ENV are required here (defense in depth — main.ts
 // gates it again).
 
-import type { ApprovalCard, ApprovalDecision, Approver, SightingCard } from "./approver.ts";
+import type {
+  ApprovalCard,
+  ApprovalDecision,
+  Approver,
+  SightingCard,
+  WriteCard,
+  WriteDecision,
+  WriteNote,
+} from "./approver.ts";
 
 export function createAutoApprover(opts: {
   env: Record<string, string | undefined>;
@@ -28,6 +36,13 @@ export function createAutoApprover(opts: {
         decided_by: "dev-auto-approver",
         decided_at: new Date().toISOString(),
       };
+    },
+    async requestWriteApproval(card: WriteCard): Promise<WriteDecision> {
+      log(`WARNING: dev auto-approver enabled — writing to the vault without human review: ${card.kind} ${card.item}`);
+      return { approved: true, decided_by: "dev-auto-approver", decided_at: new Date().toISOString() };
+    },
+    async notifyWrite(note: WriteNote): Promise<void> {
+      log(`dev auto-approver: write note ${note.id} (${note.headline}) — no notification sent`);
     },
     async notifySighting(card: SightingCard): Promise<void> {
       log(`dev auto-approver: sighting ${card.id} (${card.grant_keys.length} grant rows) — no notification sent`);

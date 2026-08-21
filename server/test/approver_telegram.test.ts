@@ -1,6 +1,11 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import type { ApprovalCard, SightingCard } from "../src/approver.ts";
-import { buildApprovalMessages, TelegramApprover } from "../src/approver_telegram.ts";
+import type { ApprovalCard, SightingCard, WriteCard } from "../src/approver.ts";
+import {
+  buildApprovalMessages,
+  buildWriteMessages,
+  TELEGRAM_MESSAGE_LIMIT,
+  TelegramApprover,
+} from "../src/approver_telegram.ts";
 import { startFakeTelegram, type FakeTelegram } from "./helpers/fake_telegram.ts";
 
 const ALLOWED_USER = 42;
@@ -70,6 +75,27 @@ function makeSightingCard(overrides: Partial<SightingCard> = {}): SightingCard {
     client_name: "client-abc",
     expires_at: new Date(Date.now() + 3_600_000).toISOString(),
     grant_keys: ["grant:a", "grant:b"],
+    ...overrides,
+  };
+}
+
+function makeWriteCard(overrides: Partial<WriteCard> = {}): WriteCard {
+  return {
+    id: crypto.randomUUID(),
+    kind: "update_description",
+    item: "Registry Token",
+    reason: "document why the registry token exists",
+    lines: [
+      { label: "现描述", value: "old description", plain: true },
+      { label: "新描述", value: "new description", plain: true },
+    ],
+    warnings: [],
+    repo: "acme/site",
+    host: "buildbox",
+    user: "randy",
+    agent: "claude-code",
+    client_name: "client-abc",
+    expires_at: new Date(Date.now() + 300_000).toISOString(),
     ...overrides,
   };
 }
@@ -179,6 +205,81 @@ test("no press within timeoutMs resolves timeout", async () => {
   const card = makeCard();
   const result = await approver.requestApproval(card, 200);
   expect(result).toEqual({ approved: false, reason: "timeout" });
+});
+
+test("a duplicate pending write id is rejected without retargeting the first card", async () => {
+  const id = crypto.randomUUID();
+  const first = approver.requestWriteApproval(makeWriteCard({ id, item: "Benign Item" }), 5000);
+  await waitFor(() => fake.sentMessages.length === 1);
+
+  const duplicate = approver.requestWriteApproval(makeWriteCard({ id, item: "Different Item" }), 200);
+  await expect(duplicate).rejects.toThrow("duplicate pending write request id");
+  expect(fake.sentMessages).toHaveLength(1);
+
+  fake.pressButton(keyboardButtons(0)[0].callback_data, ALLOWED_USER);
+  await expect(first).resolves.toMatchObject({ approved: true, decided_by: String(ALLOWED_USER) });
+});
+
+test("a stale write button cannot approve a later request that reuses the caller id", async () => {
+  const id = crypto.randomUUID();
+  const first = approver.requestWriteApproval(makeWriteCard({ id, item: "First Item" }), 200);
+  await waitFor(() => fake.sentMessages.length === 1);
+  const staleApply = keyboardButtons(0)[0].callback_data;
+
+  await expect(first).resolves.toEqual({ approved: false, reason: "timeout" });
+
+  const second = approver.requestWriteApproval(makeWriteCard({ id, item: "Second Item" }), 5000);
+  await waitFor(() => fake.sentMessages.length === 2);
+  const currentButtons = keyboardButtons(1);
+  expect(currentButtons.map((button) => button.callback_data)).not.toContain(staleApply);
+  for (const button of [...keyboardButtons(0), ...currentButtons]) {
+    expect(new TextEncoder().encode(button.callback_data).length).toBeLessThanOrEqual(64);
+  }
+
+  fake.pressButton(staleApply, ALLOWED_USER);
+  await waitFor(() => fake.answeredCallbacks.length === 1);
+  expect(fake.answeredCallbacks[0].text).toBe("已处理");
+
+  fake.pressButton(currentButtons[0].callback_data, ALLOWED_USER);
+  await expect(second).resolves.toMatchObject({ approved: true });
+});
+
+test("approving a write says it is approved, not already applied", async () => {
+  const card = makeWriteCard();
+  const decision = approver.requestWriteApproval(card, 5000);
+  await waitFor(() => fake.sentMessages.length === 1);
+
+  fake.pressButton(keyboardButtons(0)[0].callback_data, ALLOWED_USER);
+  await expect(decision).resolves.toMatchObject({ approved: true });
+  await waitFor(() => fake.answeredCallbacks.length === 1);
+  expect(fake.answeredCallbacks[0].text).toBe("已批准，等待写入");
+});
+
+test("a write card renders complete maximum-length item names and descriptions", () => {
+  const item = `${"I".repeat(499)}Z`;
+  const description = `${"D".repeat(999)}Z`;
+  const messages = buildWriteMessages(makeWriteCard({
+    item,
+    lines: [{ label: "新描述", value: description, plain: true }],
+  }));
+  const combined = messages.join("\n");
+
+  expect(combined).toContain(item);
+  expect(combined).toContain(description);
+  expect(combined).not.toContain(`${"I".repeat(319)}…`);
+  expect(combined).not.toContain(`${"D".repeat(319)}…`);
+});
+
+test("complete write details survive worst-case HTML expansion within message limits", () => {
+  const messages = buildWriteMessages(makeWriteCard({
+    item: "&".repeat(500),
+    lines: [{ label: "新描述", value: "<".repeat(1000), plain: true }],
+  }));
+  const combined = messages.join("\n");
+
+  expect(combined.match(/&amp;/g)).toHaveLength(500);
+  expect(combined.match(/&lt;/g)).toHaveLength(1000);
+  expect(messages.every((message) => message.length <= TELEGRAM_MESSAGE_LIMIT)).toBe(true);
 });
 
 test("notifySighting sends a revoke button and pressing it calls onRevoke by id", async () => {
