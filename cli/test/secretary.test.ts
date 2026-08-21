@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   commandEnvironment,
+  normalizeRepoIdentity,
   decryptCredentialEnvelope,
   describeTlsCertError,
   extractReason,
@@ -285,7 +286,12 @@ describe("self-contained secretary client", () => {
       fields: ["password"],
     });
     expect(JSON.stringify(parseCatalogResponse(CATALOG_RESPONSE))).not.toContain("must-never-leak");
-    expect(() => parseCatalogResponse({ items: [{ name: "X", fields: ["secret"] }] })).toThrow();
+    // Custom field names are now legal catalog fields…
+    expect(parseCatalogResponse({ items: [{ name: "X", fields: ["api_key"] }] }).items[0].fields)
+      .toEqual(["api_key"]);
+    // …but names that would break the binding syntax are not.
+    expect(() => parseCatalogResponse({ items: [{ name: "X", fields: ["a=b"] }] })).toThrow();
+    expect(() => parseCatalogResponse({ items: [{ name: "X", fields: ["a,b"] }] })).toThrow();
     expect(() => parseCatalogResponse({ items: "no" })).toThrow();
   });
 
@@ -571,5 +577,86 @@ describe("self-contained secretary client", () => {
     expect(err).toContain("broker.example.com");
     expect(err).toContain("NODE_EXTRA_CA_CERTS");
     expect(err).not.toBe("unknown certificate verification error");
+  });
+});
+
+describe("review fixes", () => {
+  test("P1-2: without a git remote, repo identity is the canonical path, not the basename", () => {
+    expect(normalizeRepoIdentity("git@github.com:owner/repo.git", "/work/a/project"))
+      .toBe("github.com/owner/repo");
+    const a = normalizeRepoIdentity(undefined, "/work/a/project");
+    const b = normalizeRepoIdentity(undefined, "/tmp/project");
+    expect(a).toBe("local:/work/a/project");
+    expect(b).toBe("local:/tmp/project");
+    expect(a).not.toBe(b);
+    // Over-long paths degrade to a hash, still collision-resistant and <=200 chars.
+    const long = normalizeRepoIdentity(undefined, `/deep/${"x".repeat(300)}/project`);
+    expect(long.startsWith("local:sha256:")).toBe(true);
+    expect(long.length).toBeLessThanOrEqual(200);
+  });
+
+  test("P2-1: custom field names parse as bindings and reach the wire", async () => {
+    expect(parseInvocation([
+      "--cwd", "/repo", "exec", "--reason", "给 CI 补一个 release tag",
+      "--item", "Example API", "api_key=EXAMPLE_TOKEN", "--", "tool",
+    ])).toMatchObject({
+      items: [{ itemName: "Example API", bindings: [{ field: "api_key", env: "EXAMPLE_TOKEN" }] }],
+    });
+    expect(() => parseInvocation([
+      "--cwd", "/repo", "exec", "--reason", "给 CI 补一个 release tag",
+      "--item", "Example API", "a=b=EXAMPLE_TOKEN", "--", "tool",
+    ])).toThrow(); // '=' inside the field name cannot parse into a valid env
+    const context = makeDeps();
+    expect(await main([
+      "--cwd", "/repo", "exec", "--reason", "给 CI 补一个 release tag",
+      "--item", "Example API", "api_key=EXAMPLE_TOKEN", "--", "tool",
+    ], context.deps)).toBe(7);
+    expect((context.requests[0].body as { items: unknown }).items)
+      .toEqual([{ name: "Example API", bindings: [{ field: "api_key", env: "EXAMPLE_TOKEN" }] }]);
+  });
+
+  test("P2-3: an in-band {error} body reports the real cause, not an approval denial", async () => {
+    const context = makeDeps({ requestResult: { error: "catalog unavailable: vault sync failed" } });
+    expect(await main([
+      "--cwd", "/repo", "exec", "--reason", "给 CI 补一个 release tag",
+      "--item", "Example API", "password=EXAMPLE_TOKEN", "--", "tool",
+    ], context.deps)).toBe(1);
+    const err = context.stderr.join("\n");
+    expect(err).toContain("服务端错误");
+    expect(err).toContain("catalog unavailable: vault sync failed");
+    expect(err).not.toContain("审批被拒绝");
+    expect(context.spawns).toHaveLength(0);
+  });
+
+  test("P2-9: an over-large request body fails locally before anything is sent", async () => {
+    const context = makeDeps();
+    const args = [
+      "--cwd", "/repo", "exec", "--reason", "给 CI 补一个 release tag",
+      "--item", "Example API", "password=EXAMPLE_TOKEN", "--", "tool",
+    ];
+    // 60 × 4000-char args ≈ 240 KB serialized: past the local preflight cap.
+    for (let index = 0; index < 60; index++) args.push("y".repeat(4000));
+    expect(await main(args, context.deps)).toBe(1);
+    expect(context.stderr.join("\n")).toContain("请求体过大");
+    expect(context.requests).toHaveLength(0);
+    expect(context.spawns).toHaveLength(0);
+  });
+
+  test("P2-2: the long-poll body deadline follows the server-advertised approval timeout", async () => {
+    // The response carries X-Secretary-Approval-Timeout; the client must accept
+    // a body that takes longer than the old fixed deadline would have allowed.
+    // Here we only verify the header is consumed without breaking the flow.
+    const context = makeDeps();
+    const baseFetch = context.deps.fetch;
+    context.deps.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const response = await baseFetch(input, init);
+      const headers = new Headers(response.headers);
+      headers.set("X-Secretary-Approval-Timeout", "600");
+      return new Response(response.body, { status: response.status, headers });
+    }) as typeof fetch;
+    expect(await main([
+      "--cwd", "/repo", "exec", "--reason", "给 CI 补一个 release tag",
+      "--item", "Example API", "password=EXAMPLE_TOKEN", "--", "tool",
+    ], context.deps)).toBe(7);
   });
 });

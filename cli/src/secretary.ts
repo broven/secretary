@@ -6,6 +6,7 @@
 // file must stay a single self-contained module (no imports from server/).
 
 import { realpath, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { basename } from "node:path";
 import { hostname, userInfo } from "node:os";
 
@@ -27,9 +28,14 @@ const RESERVED_ENV = new Set([
 ]);
 const RESERVED_PREFIXES = ["SECRETARY_", "WMILL_", "FNOX_", "SENV_", "BW_", "MISE_", "APPROVED_SECRET_"];
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
-// One blocking POST covers the whole approval: server-side approval timeout is
-// 300 s, plus margin for network and heartbeat flushing.
-const REQUEST_TIMEOUT_MS = 330_000;
+// Headers of the long poll arrive immediately; the body deadline is derived
+// from the server-advertised approval timeout (X-Secretary-Approval-Timeout)
+// plus this margin, so the client always outlives the server-side window.
+const HEADER_TIMEOUT_MS = 30_000;
+const DEFAULT_APPROVAL_TIMEOUT_S = 300;
+const BODY_TIMEOUT_MARGIN_MS = 30_000;
+// The broker rejects bodies over 256 KiB; leave headroom for encoding.
+const MAX_REQUEST_BODY_BYTES = 200_000;
 const CATALOG_TIMEOUT_MS = 60_000;
 const MAX_ITEMS = 10;
 const EXEC_USAGE =
@@ -41,7 +47,13 @@ const MAX_REASON_LENGTH = 2000;
 const MAX_ARGV_ENTRIES = 200;
 const MAX_ARGV_ENTRY_LENGTH = 4096;
 
-export type CatalogField = "username" | "password";
+// "username", "password", or a custom field name on the login item. Custom
+// names may not contain '=' or ',' (binding syntax) or control characters.
+export type CatalogField = string;
+const FIELD_NAME = /^[^=,\u0000-\u001f\u007f]{1,64}$/;
+export function isValidFieldName(value: string): boolean {
+  return value === value.trim() && FIELD_NAME.test(value);
+}
 export type Binding = { field: CatalogField; env: string };
 export type CatalogResponse = {
   items: Array<{ name: string; description: string; fields: CatalogField[] }>;
@@ -110,11 +122,13 @@ function isReservedEnv(name: string): boolean {
 }
 
 function parseSingleBinding(value: string): Binding {
-  const match = value.match(/^(username|password)=([A-Z][A-Z0-9_]*)$/);
-  if (!match) throw new Error(`无效 binding：${value}`);
-  const field = match[1] as CatalogField;
-  const env = match[2];
-  if (!ENV_NAME.test(env) || isReservedEnv(env)) throw new Error(`不能绑定到环境变量：${env}`);
+  const separator = value.indexOf("=");
+  if (separator <= 0 || separator === value.length - 1) throw new Error(`无效 binding：${value}`);
+  const field = value.slice(0, separator);
+  const env = value.slice(separator + 1);
+  if (!isValidFieldName(field)) throw new Error(`无效 binding 字段名：${field}`);
+  if (!ENV_NAME.test(env)) throw new Error(`无效 binding：${value}`);
+  if (isReservedEnv(env)) throw new Error(`不能绑定到环境变量：${env}`);
   return { field, env };
 }
 
@@ -244,7 +258,8 @@ export function parseCatalogResponse(value: unknown): CatalogResponse {
     const item = raw as Record<string, unknown>;
     if (typeof item.name !== "string" || !item.name.trim() || item.name.length > 500 ||
       !Array.isArray(item.fields)) throw new Error("密钥目录条目无效");
-    const fields = item.fields.filter((field): field is CatalogField => field === "username" || field === "password");
+    const fields = item.fields.filter((field): field is CatalogField =>
+      typeof field === "string" && isValidFieldName(field));
     if (fields.length === 0 || fields.length !== item.fields.length || new Set(fields).size !== fields.length) {
       throw new Error("密钥目录字段无效");
     }
@@ -425,6 +440,10 @@ async function readTextLimited(response: Response): Promise<string> {
   return text;
 }
 
+function timeoutError(): Error {
+  return Object.assign(new Error("secretary 请求超时"), { name: "TimeoutError" });
+}
+
 async function brokerJson(
   deps: ClientDeps,
   token: string,
@@ -433,31 +452,50 @@ async function brokerJson(
     method: string;
     body?: unknown;
     timeoutMs: number;
+    /** When set, the deadline for reading the (long-polled) body is derived
+     * from the response headers once they arrive — so the client deadline
+     * always exceeds the server's configured approval timeout. */
+    bodyTimeoutMsFromResponse?: (response: Response) => number;
     signal?: AbortSignal;
     onNetworkError?: (error: unknown) => Error;
   },
 ): Promise<unknown> {
+  const controller = new AbortController();
+  let timer = setTimeout(() => controller.abort(timeoutError()), init.timeoutMs);
   let response: Response;
+  let text: string;
   try {
-    response = await deps.fetch(url, {
-      method: init.method,
-      redirect: "error",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        ...(init.body === undefined ? {} : { "Content-Type": "application/json" }),
-      },
-      body: init.body === undefined ? undefined : JSON.stringify(init.body),
-      signal: init.signal
-        ? AbortSignal.any([AbortSignal.timeout(init.timeoutMs), init.signal])
-        : AbortSignal.timeout(init.timeoutMs),
-    });
-  } catch (error) {
-    // A cert failure gets rewritten with the host and remedy. Any other network
-    // failure goes through the caller's wrapper (exec fails closed: no resend).
-    if (isTlsCertError(error)) throw describeTlsCertError(url.host, error);
-    throw init.onNetworkError ? init.onNetworkError(error) : error;
+    try {
+      response = await deps.fetch(url, {
+        method: init.method,
+        redirect: "error",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          ...(init.body === undefined ? {} : { "Content-Type": "application/json" }),
+        },
+        body: init.body === undefined ? undefined : JSON.stringify(init.body),
+        signal: init.signal
+          ? AbortSignal.any([controller.signal, init.signal])
+          : controller.signal,
+      });
+    } catch (error) {
+      // A cert failure gets rewritten with the host and remedy. Any other network
+      // failure goes through the caller's wrapper (exec fails closed: no resend).
+      if (isTlsCertError(error)) throw describeTlsCertError(url.host, error);
+      throw init.onNetworkError ? init.onNetworkError(error) : error;
+    }
+    if (init.bodyTimeoutMsFromResponse) {
+      clearTimeout(timer);
+      timer = setTimeout(() => controller.abort(timeoutError()), init.bodyTimeoutMsFromResponse(response));
+    }
+    try {
+      text = await readTextLimited(response);
+    } catch (error) {
+      throw init.onNetworkError ? init.onNetworkError(error) : error;
+    }
+  } finally {
+    clearTimeout(timer);
   }
-  const text = await readTextLimited(response);
   if (!response.ok) {
     let detail = "";
     try {
@@ -473,9 +511,15 @@ async function brokerJson(
 
 // ---------------------------------------------------------------------------
 
-function normalizeRepoIdentity(remote: string | undefined, cwd: string): string {
+export function normalizeRepoIdentity(remote: string | undefined, cwd: string): string {
   const value = remote?.trim().replace(/\/+$/, "").replace(/\.git$/, "");
-  if (!value) return basename(cwd);
+  if (!value) {
+    // No origin remote: derive a collision-resistant identity from the
+    // canonical absolute path — two unrelated directories that share a
+    // basename must not share Grant keys.
+    const local = `local:${cwd}`;
+    return local.length <= 200 ? local : `local:sha256:${createHash("sha256").update(cwd).digest("hex")}`;
+  }
   const scp = value.includes("://") ? null : value.match(/^([^@]+@)?([^:]+):(.+)$/);
   if (scp) return `${scp[2]}/${scp[3]}`;
   try {
@@ -644,6 +688,12 @@ export async function main(args: string[], deps: ClientDeps = defaultDeps): Prom
     // 这一行在请求发出**之前**打印，而此时还不知道服务端会不会命中已有授权。
     // 所以措辞必须对两种结果都成立——写死「正在等待审批」会在静默复用时
     // 把人白白支使到手机上去看一条根本没发出的通知。
+    // P2-9: the broker caps request bodies at 256 KiB; fail locally with a
+    // clear message instead of a post-hoc HTTP 413.
+    if (JSON.stringify(body).length > MAX_REQUEST_BODY_BYTES) {
+      throw new Error("请求体过大（命令 argv 或条目过多）；请缩短命令或拆分请求");
+    }
+
     deps.stderr("正在向 secretary 申请密钥（无有效授权时会推 Telegram 审批）…");
     let interrupted = false;
     const operationAbort = new AbortController();
@@ -656,7 +706,17 @@ export async function main(args: string[], deps: ClientDeps = defaultDeps): Prom
       result = await brokerJson(deps, config.token, new URL(`${config.url}/v1/requests`), {
         method: "POST",
         body,
-        timeoutMs: REQUEST_TIMEOUT_MS,
+        // Headers must arrive quickly; the long-polled body deadline is then
+        // derived from the server-advertised approval timeout so the client
+        // always outlives the server-side parking window.
+        timeoutMs: HEADER_TIMEOUT_MS,
+        bodyTimeoutMsFromResponse: (response) => {
+          const advertised = Number(response.headers.get("x-secretary-approval-timeout"));
+          const seconds = Number.isFinite(advertised) && advertised >= 1 && advertised <= 3600
+            ? advertised
+            : DEFAULT_APPROVAL_TIMEOUT_S;
+          return seconds * 1000 + BODY_TIMEOUT_MARGIN_MS;
+        },
         signal: operationAbort.signal,
         // Fail closed, never resend: the request may already have reached the
         // broker (an identical resend would be idempotent server-side via
@@ -675,6 +735,13 @@ export async function main(args: string[], deps: ClientDeps = defaultDeps): Prom
       });
     } finally {
       removeInterruptHandler();
+    }
+    // A long-polled 200 can carry an in-band {error} (vault outage, unknown
+    // item, encryption failure) — surface the real cause, never misreport it
+    // as an approval denial.
+    if (result && typeof result === "object" && !Array.isArray(result) &&
+      typeof (result as { error?: unknown }).error === "string") {
+      throw new Error(`secretary 服务端错误：${String((result as { error: string }).error).slice(0, 500)}`);
     }
     const approved = await validateApprovalResult(
       result, allBindings, deps.now(), clientKeys.privateKey, requestId,
