@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import type { ApprovalCard, SightingCard } from "../src/approver.ts";
-import { TelegramApprover } from "../src/approver_telegram.ts";
+import { buildApprovalMessages, TelegramApprover } from "../src/approver_telegram.ts";
 import { startFakeTelegram, type FakeTelegram } from "./helpers/fake_telegram.ts";
 
 const ALLOWED_USER = 42;
@@ -238,4 +238,58 @@ test("HTML in the command arrives escaped", async () => {
 
   fake.pressButton(`ap:${card.id}:deny`, ALLOWED_USER);
   await decision;
+});
+
+test("a 10-item card renders EVERY item and mapping, keyboard on the last message (P1-i/ii)", async () => {
+  const items = Array.from({ length: 10 }, (_, index) => ({
+    name: `Item Number ${index} With A Fairly Long Display Name For Padding Purposes`,
+    description: "d".repeat(500),
+    bindings: [
+      { field: `custom_field_number_${index}_${"x".repeat(40)}`, env: `A_RATHER_LONG_ENV_VARIABLE_NAME_${"Y".repeat(80)}_${index}` },
+      { field: "password", env: `PASSWORD_ENV_${index}` },
+    ],
+  }));
+  const card = makeCard({ items });
+  const decision = approver.requestApproval(card, 5000);
+  await waitFor(() => fake.sentMessages.length >= 1);
+  // Give the multi-message send a moment to finish.
+  await waitFor(() => {
+    const last = fake.sentMessages.at(-1);
+    return Boolean(last && last.reply_markup);
+  });
+  const combined = fake.sentMessages.map((message) => message.text).join("\n");
+  for (let index = 0; index < 10; index++) {
+    expect(combined).toContain(`custom_field_number_${index}_${"x".repeat(40)} → A_RATHER_LONG_ENV_VARIABLE_NAME_${"Y".repeat(80)}_${index}`);
+    expect(combined).toContain(`password → PASSWORD_ENV_${index}`);
+  }
+  expect(combined).toContain("docker login");
+  // Keyboard only on the final message.
+  for (const message of fake.sentMessages.slice(0, -1)) {
+    expect(message.reply_markup).toBeUndefined();
+  }
+  expect(fake.sentMessages.at(-1)!.reply_markup).toBeDefined();
+  expect(fake.sentMessages.length).toBeGreaterThan(1);
+
+  fake.pressButton(`ap:${card.id}:approve_1h`, ALLOWED_USER);
+  const result = await decision;
+  expect(result).toMatchObject({ approved: true, ttl: "1h" });
+});
+
+test("an unrenderable card rejects the request instead of sending a truncated one (P1-iii)", async () => {
+  // One block that cannot fit a message even alone: an item whose mapping is
+  // pathologically long (10 near-max custom names full of HTML escapables).
+  const monstrous = {
+    name: "Monster",
+    description: "",
+    bindings: Array.from({ length: 10 }, (_, index) => ({
+      field: `${"&".repeat(60)}${index.toString().padStart(3, "0")}`,
+      env: `E${"N".repeat(120)}${index}`,
+    })),
+  };
+  expect(() => buildApprovalMessages(makeCard({ items: [monstrous] })))
+    .toThrow("cannot be rendered completely");
+  await expect(approver.requestApproval(makeCard({ items: [monstrous] }), 5000))
+    .rejects.toThrow("cannot be rendered completely");
+  // Nothing was parked or sent.
+  expect(fake.sentMessages.length).toBe(0);
 });

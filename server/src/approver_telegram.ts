@@ -24,7 +24,8 @@ import { isSecretGrantTtl, type ApprovalTtl } from "./types.ts";
 // Rendering (ported from approval_telegram.ts)
 // ---------------------------------------------------------------------------
 
-/** Max fields rendered in one Telegram message; overflow is announced, not dropped silently. */
+/** Max fields rendered in one Telegram message (Sighting notifications only —
+ * approval cards render completely or fail closed, see buildApprovalMessages). */
 export const MAX_TELEGRAM_FIELDS = 6;
 /** Character budget for a plain field value. */
 export const FIELD_VALUE_LIMIT = 320;
@@ -94,43 +95,72 @@ function renderCardText(subject: string, summary: string, fields: CardField[], f
   ].join("\n");
 }
 
-function approvalFields(card: ApprovalCard): CardField[] {
-  // Ported from buildContext: decision-critical "what runs" and "which keys"
-  // come before provenance. The reason is already the summary line.
-  return [
-    ...(card.command ? [{ label: "命令", value: card.command, block: true }] : []),
-    ...(card.inline_shell
-      ? [{
-        label: "注意",
-        value: "内联 shell 代码：只放行本次执行，不会写入免审授权。",
-        monospace: false,
-      }]
-      : []),
-    ...card.items.map((item, index) => ({
-      label: `密钥 ${index + 1} · ${item.name}`,
-      // Decision-critical mapping FIRST: the Owner must always see exactly
-      // which credential fields are being granted. Only the free-form item
-      // description is truncated, on its own smaller budget, so a long notes
-      // text can never push the mapping off the card.
-      value: [
-        `字段映射：${item.bindings.map((binding) => `${binding.field} → ${binding.env}`).join("，")}`,
-        limit(item.description || "（未填写 notes 描述）", ITEM_DESCRIPTION_LIMIT),
-      ].join("\n"),
-      monospace: false,
-    })),
-    { label: "仓库", value: card.repo },
-    { label: "来源", value: [card.host, card.user, card.agent].filter(Boolean).join(" · ") },
-    ...(card.client_name ? [{ label: "客户端", value: card.client_name }] : []),
-  ].filter((field) => field.value);
-}
+/** Raw-HTML budget per message, conservatively under Telegram's 4096 cap. */
+export const TELEGRAM_MESSAGE_LIMIT = 3900;
+/** An approval card may span at most this many messages before failing closed. */
+export const MAX_APPROVAL_MESSAGES = 4;
 
-export function buildApprovalText(card: ApprovalCard): string {
-  return renderCardText(
-    `密钥使用审批：${card.items.length} 个 Bitwarden 条目 @ ${card.repo || "?"}`,
-    card.reason,
-    approvalFields(card),
-    `<i>审批截止：${escapeHtml(card.expires_at)} · 请直接点击下方按钮提交审批决定。</i>`,
-  );
+/**
+ * Render the approval card COMPLETELY: every item, every field → env mapping,
+ * and the full (pre-bounded) command display must appear — split across up to
+ * MAX_APPROVAL_MESSAGES messages when needed (the keyboard goes on the last
+ * one). Only the free-form pieces (reason, item notes, provenance) are ever
+ * truncated. If a complete rendering is impossible, throw — the broker then
+ * rejects the request instead of asking the Owner to approve a card that
+ * hides part of what it grants.
+ */
+export function buildApprovalMessages(card: ApprovalCard): string[] {
+  const header = [
+    `🔔 <b>${escapeHtml(limit(`密钥使用审批：${card.items.length} 个 Bitwarden 条目 @ ${card.repo || "?"}`, 180))}</b>`,
+    ...(card.reason ? [escapeHtml(limit(card.reason, 400))] : []),
+  ].join("\n");
+  const footer = `<i>审批截止：${escapeHtml(card.expires_at)} · 请直接点击下方按钮提交审批决定。</i>`;
+
+  const blocks: string[] = [];
+  if (card.command) {
+    // The command display is already bounded upstream (formatCommandDisplay
+    // truncates at 900 chars + fingerprint); it is never truncated here.
+    blocks.push(`<b>命令</b>:\n<pre><code class="language-bash">${escapeHtml(card.command)}</code></pre>`);
+  }
+  if (card.inline_shell) {
+    blocks.push(`<b>注意</b>: ${escapeHtml("内联 shell 代码：只放行本次执行，不会写入免审授权。")}`);
+  }
+  card.items.forEach((item, index) => {
+    // Decision-critical: the mapping renders in full, never limited.
+    const mapping = `字段映射：${item.bindings.map((binding) => `${binding.field} → ${binding.env}`).join("，")}`;
+    blocks.push([
+      `<b>${escapeHtml(limit(`密钥 ${index + 1} · ${item.name}`, 260))}</b>:`,
+      escapeHtml(mapping),
+      escapeHtml(limit(item.description || "（未填写 notes 描述）", ITEM_DESCRIPTION_LIMIT)),
+    ].join("\n"));
+  });
+  const provenance = [
+    `<b>仓库</b>: <code>${escapeHtml(limit(card.repo, FIELD_VALUE_LIMIT))}</code>`,
+    `<b>来源</b>: <code>${escapeHtml(limit([card.host, card.user, card.agent].filter(Boolean).join(" · "), FIELD_VALUE_LIMIT))}</code>`,
+    ...(card.client_name ? [`<b>客户端</b>: <code>${escapeHtml(limit(card.client_name, FIELD_VALUE_LIMIT))}</code>`] : []),
+  ].join("\n");
+  blocks.push(provenance);
+
+  const messages: string[] = [];
+  let current = header;
+  const flush = () => {
+    messages.push(current);
+    current = `🔔 <b>${escapeHtml(limit(`密钥使用审批（续 ${messages.length + 1}）`, 180))}</b>`;
+  };
+  for (const block of blocks) {
+    if (block.length > TELEGRAM_MESSAGE_LIMIT) {
+      throw new Error("approval card cannot be rendered completely; rejecting the request");
+    }
+    if (current.length + 2 + block.length > TELEGRAM_MESSAGE_LIMIT) flush();
+    current += `\n\n${block}`;
+  }
+  if (current.length + 2 + footer.length > TELEGRAM_MESSAGE_LIMIT) flush();
+  current += `\n\n${footer}`;
+  messages.push(current);
+  if (messages.length > MAX_APPROVAL_MESSAGES) {
+    throw new Error("approval card cannot be rendered completely; rejecting the request");
+  }
+  return messages;
 }
 
 export function buildSightingText(card: SightingCard): string {
@@ -330,17 +360,24 @@ export class TelegramApprover implements Approver {
       this.pending.set(card.id, entry);
     });
     try {
-      await this.api("sendMessage", {
-        chat_id: this.chatId,
-        text: buildApprovalText(card),
-        parse_mode: "HTML",
-        disable_web_page_preview: true,
-        reply_markup: buildApprovalKeyboard(card),
-      }, AbortSignal.timeout(Math.min(timeoutMs, 30_000)));
+      // The card renders completely (every item, every mapping, the command)
+      // across one or more messages, or buildApprovalMessages throws and the
+      // request is rejected. The keyboard rides on the LAST message so the
+      // Owner has scrolled past everything the buttons would grant.
+      const texts = buildApprovalMessages(card);
+      for (let index = 0; index < texts.length; index++) {
+        await this.api("sendMessage", {
+          chat_id: this.chatId,
+          text: texts[index],
+          parse_mode: "HTML",
+          disable_web_page_preview: true,
+          ...(index === texts.length - 1 ? { reply_markup: buildApprovalKeyboard(card) } : {}),
+        }, AbortSignal.timeout(Math.min(timeoutMs, 30_000)));
+      }
     } catch (error) {
-      // sendMessage failures propagate: the caller treats an undeliverable card
-      // as a failed request (fail closed), not a silent deny — unless a
-      // decision somehow already landed.
+      // Rendering and sendMessage failures propagate: the caller treats an
+      // undeliverable/incomplete card as a failed request (fail closed), not a
+      // silent deny — unless a decision somehow already landed.
       if (this.pending.get(card.id) === entry!) {
         clearTimeout(entry!.timer);
         this.pending.delete(card.id);

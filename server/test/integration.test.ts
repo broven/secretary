@@ -357,6 +357,26 @@ describe("broker integration (fake telegram + fake vault)", () => {
     expect(health.status).toBe(200);
   }, 15_000);
 
+  test("chunked bodies past 256 KiB are rejected while streaming (P2-i)", async () => {
+    const stack = await startStack();
+    const chunk = new TextEncoder().encode("x".repeat(64 * 1024));
+    // A streamed body with no content-length: the server must cut it off at
+    // the cap instead of buffering it fully.
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (let index = 0; index < 6; index++) controller.enqueue(chunk);
+        controller.close();
+      },
+    });
+    const response = await fetch(`${stack.url}/v1/requests`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${stack.token}`, "Content-Type": "application/json" },
+      body,
+    });
+    expect(response.status).toBe(413);
+    expect(((await response.json()) as { error: string }).error).toContain("too large");
+  }, 15_000);
+
   test("duplicate request_id shares one execution (idempotent delivery)", async () => {
     const stack = await startStack();
     const keys = await clientKeys();

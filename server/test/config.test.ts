@@ -13,14 +13,25 @@ const BASE_ENV = {
 };
 
 describe("readSecretEnv", () => {
-  test("reads the plain env value trimmed", () => {
-    expect(readSecretEnv({ TOKEN: "  value \n" }, "TOKEN")).toBe("value");
+  test("reads the plain env value verbatim — secrets may contain whitespace", () => {
+    expect(readSecretEnv({ TOKEN: "  value with spaces " }, "TOKEN")).toBe("  value with spaces ");
+    expect(readSecretEnv({ TOKEN: "value\n" }, "TOKEN")).toBe("value\n");
   });
 
-  test("reads the _FILE variant trimmed", () => {
-    const files: Record<string, string> = { "/run/secrets/token": "from-file\n" };
-    expect(readSecretEnv({ TOKEN_FILE: "/run/secrets/token" }, "TOKEN", (path) => files[path]))
-      .toBe("from-file");
+  test("_FILE variant strips exactly one trailing newline", () => {
+    const files: Record<string, string> = {
+      "/one": "from-file\n",
+      "/crlf": "from-file\r\n",
+      "/two": "from-file\n\n",
+      "/spaces": " padded ",
+      "/none": "from-file",
+    };
+    const read = (path: string) => files[path];
+    expect(readSecretEnv({ TOKEN_FILE: "/one" }, "TOKEN", read)).toBe("from-file");
+    expect(readSecretEnv({ TOKEN_FILE: "/crlf" }, "TOKEN", read)).toBe("from-file");
+    expect(readSecretEnv({ TOKEN_FILE: "/two" }, "TOKEN", read)).toBe("from-file\n");
+    expect(readSecretEnv({ TOKEN_FILE: "/spaces" }, "TOKEN", read)).toBe(" padded ");
+    expect(readSecretEnv({ TOKEN_FILE: "/none" }, "TOKEN", read)).toBe("from-file");
   });
 
   test("rejects both plain and _FILE set at once", () => {

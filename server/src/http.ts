@@ -32,6 +32,35 @@ function json(status: number, value: unknown): Response {
   });
 }
 
+/** Read the request body, throwing as soon as the byte count passes maxBytes. */
+async function readBodyLimited(request: Request, maxBytes: number): Promise<string> {
+  if (!request.body) return "";
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new Error("body too large");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
+}
+
 function bearerToken(request: Request): string | null {
   const header = request.headers.get("Authorization") ?? "";
   const match = header.match(/^Bearer\s+(\S+)$/);
@@ -121,10 +150,16 @@ export function startHttpServer(deps: HttpDeps) {
       if (url.pathname === "/v1/requests" && request.method === "POST") {
         const lengthHeader = Number(request.headers.get("content-length") ?? 0);
         if (lengthHeader > MAX_BODY_BYTES) return json(413, { error: "body too large" });
+        // Enforce the cap WHILE reading: a chunked body must not buffer past
+        // the limit before being rejected.
+        let text: string;
+        try {
+          text = await readBodyLimited(request, MAX_BODY_BYTES);
+        } catch {
+          return json(413, { error: "body too large" });
+        }
         let body: unknown;
         try {
-          const text = await request.text();
-          if (text.length > MAX_BODY_BYTES) return json(413, { error: "body too large" });
           body = JSON.parse(text);
         } catch {
           return json(400, { error: "invalid JSON body" });

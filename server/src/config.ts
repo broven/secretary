@@ -1,6 +1,7 @@
 // Broker configuration. Everything comes from the environment; every env that
 // carries a secret also accepts a `_FILE` variant pointing at a file whose
-// trimmed contents are the value (docker secrets are the documented default).
+// contents (minus one trailing newline) are the value (docker secrets are the
+// documented default).
 
 import { readFileSync } from "node:fs";
 
@@ -27,7 +28,9 @@ export const DEFAULT_SYNC_MAX_AGE_S = 60;
 export type Env = Record<string, string | undefined>;
 
 /**
- * Read `NAME`, or the trimmed contents of the file named by `NAME_FILE`.
+ * Read `NAME` verbatim, or the contents of the file named by `NAME_FILE` with
+ * exactly one trailing newline stripped (the editor/echo artifact) — secrets
+ * may legitimately contain leading/trailing whitespace, so no trim().
  * Setting both is a configuration error — silently preferring one would make
  * a stale plain-env value shadow the mounted secret (or vice versa).
  */
@@ -48,9 +51,9 @@ export function readSecretEnv(
     } catch (error) {
       throw new Error(`Cannot read ${name}_FILE (${filePath}): ${error instanceof Error ? error.message : String(error)}`);
     }
-    return value.trim();
+    return value.replace(/\r?\n$/, "");
   }
-  return (direct ?? "").trim();
+  return direct ?? "";
 }
 
 function requireValue(value: string, name: string): string {
