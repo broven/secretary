@@ -433,12 +433,34 @@ describe("self-contained secretary client", () => {
     expect(context.stderr.join("")).toContain("无法解密");
   });
 
-  test("prints the reuse notice when the server reused a standing grant", async () => {
-    const context = makeDeps({ resultExtras: { grant_reused: true } });
+  test("says which path a success took, so the fast path is legible", async () => {
+    const reused = makeDeps({ resultExtras: { grant_reused: true } });
     expect(await main([
       "--cwd", "/repo", "exec", "--reason", "给 CI 补一个 release tag", "--item", "Example API", "password=EXAMPLE_TOKEN", "--", "tool",
-    ], context.deps)).toBe(7);
-    expect(context.stderr.join("")).toContain("复用");
+    ], reused.deps)).toBe(7);
+    expect(reused.stderr.join("")).toContain("命中已有授权");
+
+    const approved = makeDeps();
+    expect(await main([
+      "--cwd", "/repo", "exec", "--reason", "给 CI 补一个 release tag", "--item", "Example API", "password=EXAMPLE_TOKEN", "--", "tool",
+    ], approved.deps)).toBe(7);
+    expect(approved.stderr.join("")).toContain("经 Owner 审批通过");
+  });
+
+  test("giving up on the wait is reported as pending, not as a failure", async () => {
+    const context = makeDeps();
+    context.deps.fetch = (async () => {
+      throw Object.assign(new Error("aborted"), { name: "TimeoutError" });
+    }) as typeof fetch;
+    // Distinct exit code: "not answered yet" must not read as a broken command.
+    expect(await main([
+      "--cwd", "/repo", "exec", "--reason", "给 CI 补一个 release tag", "--item", "Example API", "password=EXAMPLE_TOKEN", "--", "tool",
+    ], context.deps)).toBe(75);
+    expect(context.spawns).toHaveLength(0);
+    const message = context.stderr.join("");
+    expect(message).toContain("尚未批准");
+    expect(message).toContain("重跑");
+    expect(message).toContain(uuid(1));
   });
 
   test("decrypts only with the per-request in-memory private key", async () => {
@@ -563,7 +585,10 @@ describe("self-contained secretary client", () => {
     expect(calls).toBe(1);
     expect(context.spawns).toHaveLength(0);
     const message = context.stderr.join("");
-    expect(message).toContain("不会自动重发");
+    // An interrupted connection may mean the Owner already approved, so the
+    // message must not call itself a timeout — re-running is how you find out.
+    expect(message).toContain("无法确认本次审批结果");
+    expect(message).not.toContain("超时");
     expect(message).toContain(uuid(1));
   });
 

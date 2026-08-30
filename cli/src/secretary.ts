@@ -32,12 +32,20 @@ const RESERVED_ENV = new Set([
 ]);
 const RESERVED_PREFIXES = ["SECRETARY_", "WMILL_", "FNOX_", "SENV_", "BW_", "MISE_", "APPROVED_SECRET_"];
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
-// Headers of the long poll arrive immediately; the body deadline is derived
-// from the server-advertised approval timeout (X-Secretary-Approval-Timeout)
-// plus this margin, so the client always outlives the server-side window.
+// Headers of the long poll arrive immediately.
 const HEADER_TIMEOUT_MS = 30_000;
-const DEFAULT_APPROVAL_TIMEOUT_S = 300;
-const BODY_TIMEOUT_MARGIN_MS = 30_000;
+/**
+ * How long this process waits for a decision before giving up and telling its
+ * caller to re-run (ADR-0006). It is deliberately far below the broker's
+ * approval window, and below every agent harness's default command timeout —
+ * a command killed by the harness reports nothing at all, which is exactly the
+ * ambiguity this wait exists to remove. Giving up costs nothing: the Request
+ * stays parked, the Owner still has a live card, and approving it mints the
+ * Grant that makes the re-run a fast path.
+ */
+const APPROVAL_WAIT_MS = 100_000;
+/** Exit code for "the Owner has not answered yet" — distinct from a real failure. */
+const EXIT_PENDING_APPROVAL = 75;
 // The broker rejects bodies over 256 KiB; leave headroom for encoding.
 const MAX_REQUEST_BODY_BYTES = 200_000;
 const CATALOG_TIMEOUT_MS = 60_000;
@@ -927,19 +935,25 @@ async function runWrite(
       method: "POST",
       body,
       timeoutMs: HEADER_TIMEOUT_MS,
-      bodyTimeoutMsFromResponse: (response) => {
-        const advertised = Number(response.headers.get("x-secretary-approval-timeout"));
-        const seconds = Number.isFinite(advertised) && advertised >= 1 && advertised <= 3600
-          ? advertised
-          : DEFAULT_APPROVAL_TIMEOUT_S;
-        return seconds * 1000 + BODY_TIMEOUT_MARGIN_MS;
-      },
+      bodyTimeoutMsFromResponse: () => APPROVAL_WAIT_MS,
       signal: operationAbort.signal,
       // Never resend: the write may already have landed, and a blind retry of a
       // Create would be refused as a name collision anyway (ADR-0005).
       onNetworkError: (error) => {
         if (interrupted) return new Error("已中断等待审批");
         const message = error instanceof Error ? error.message : String(error);
+        // A write has no fast path to re-run into: the vault changes at the
+        // moment of approval, server-side. So the honest answer is "unknown",
+        // and `list` is how the caller finds out.
+        if (error instanceof Error && error.name === "TimeoutError") {
+          return Object.assign(
+            new Error(
+              `Owner 尚未批准这次写入（request_id=${requestId}）。审批卡片已推送，仍然有效。\n` +
+              `vault 目前未改动。等本人批准后，用 secretary list "${invocation.item}" 确认结果——不要重发这条申请。`,
+            ),
+            { exitCode: EXIT_PENDING_APPROVAL },
+          );
+        }
         return new Error(
           `与 secretary 的连接失败或在请求发出后中断（request_id=${requestId}）；不会自动重发。` +
           `请先用 secretary list "${invocation.item}" 确认写入是否已经生效：${message}`,
@@ -1058,17 +1072,12 @@ export async function main(args: string[], deps: ClientDeps = defaultDeps): Prom
       result = await brokerJson(deps, config.token, new URL(`${config.url}/v1/requests`), {
         method: "POST",
         body,
-        // Headers must arrive quickly; the long-polled body deadline is then
-        // derived from the server-advertised approval timeout so the client
-        // always outlives the server-side parking window.
+        // Headers must arrive quickly; the body wait is this client's own
+        // bounded window, NOT the broker's (ADR-0006). Outwaiting the broker
+        // would mean outwaiting the agent harness that spawned us, and a
+        // harness-killed command reports nothing at all.
         timeoutMs: HEADER_TIMEOUT_MS,
-        bodyTimeoutMsFromResponse: (response) => {
-          const advertised = Number(response.headers.get("x-secretary-approval-timeout"));
-          const seconds = Number.isFinite(advertised) && advertised >= 1 && advertised <= 3600
-            ? advertised
-            : DEFAULT_APPROVAL_TIMEOUT_S;
-          return seconds * 1000 + BODY_TIMEOUT_MARGIN_MS;
-        },
+        bodyTimeoutMsFromResponse: () => APPROVAL_WAIT_MS,
         signal: operationAbort.signal,
         // Fail closed, never resend: the request may already have reached the
         // broker (an identical resend would be idempotent server-side via
@@ -1077,11 +1086,22 @@ export async function main(args: string[], deps: ClientDeps = defaultDeps): Prom
           if (interrupted) return new Error("已中断等待审批");
           const message = error instanceof Error ? error.message : String(error);
           if (error instanceof Error && error.name === "TimeoutError") {
-            return new Error(`等待 secretary 审批响应超时（request_id=${requestId}）；不会自动重发，请确认审批状态后重试`);
+            // Not a failure: we stopped waiting, the Request did not stop
+            // existing. Approving mints the Grant, so the re-run is a fast path.
+            return Object.assign(
+              new Error(
+                `Owner 尚未批准这次申请（request_id=${requestId}）。审批卡片已推送，仍然有效。\n` +
+                `未取得任何密钥。等本人批准后重跑同一条命令即可——命中授权会秒过，不要重新提交申请。`,
+              ),
+              { exitCode: EXIT_PENDING_APPROVAL },
+            );
           }
+          // Deliberately not called a timeout: it means the opposite of one.
+          // The Request may well have been approved and the Grant already
+          // minted; re-running is how you find out, and it is cheap.
           return new Error(
-            `与 secretary 的连接失败或在请求发出后中断（request_id=${requestId}）；` +
-            `为安全起见不会自动重发，请确认服务端状态后重试：${message}`,
+            `无法确认本次审批结果（request_id=${requestId}）：与 secretary 的连接中断，可能已经批准。\n` +
+            `直接重跑同一条命令即可——若已获授权会走 fast path 秒过：${message}`,
           );
         },
       });
@@ -1098,9 +1118,11 @@ export async function main(args: string[], deps: ClientDeps = defaultDeps): Prom
     const approved = await validateApprovalResult(
       result, allBindings, deps.now(), clientKeys.privateKey, requestId,
     );
-    if (approved.grant_reused) {
-      deps.stderr(`已复用服务端仍有效的授权（到期：${approved.expires_at}）。\n`);
-    }
+    // Say which path this was: an agent that never sees the difference cannot
+    // learn that "no Telegram card appeared" is a normal, common outcome.
+    deps.stderr(approved.grant_reused
+      ? `本次命中已有授权，未打扰 Owner（到期：${approved.expires_at}）。\n`
+      : `本次经 Owner 审批通过，授权有效期至 ${approved.expires_at}。\n`);
     return await deps.spawn(
       invocation.command,
       canonicalCwd,
@@ -1108,8 +1130,14 @@ export async function main(args: string[], deps: ClientDeps = defaultDeps): Prom
     );
   } catch (error) {
     deps.stderr(error instanceof Error ? error.message : String(error));
-    return 1;
+    return exitCodeFor(error);
   }
+}
+
+/** "Not answered yet" is not a failure and must not look like one. */
+function exitCodeFor(error: unknown): number {
+  const code = (error as { exitCode?: unknown })?.exitCode;
+  return typeof code === "number" ? code : 1;
 }
 
 // ---------------------------------------------------------------------------

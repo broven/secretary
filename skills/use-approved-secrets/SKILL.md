@@ -69,9 +69,26 @@ approved-secret exec --reason "nightly sync between GitHub and OpenAI usage data
 ```
 
 Every env name must be unique across all `--item` groups; each field may be bound once;
-up to 10 items per approval. `exec` blocks until it has an answer. A previously approved
-request may be reused silently with no Telegram prompt at all — so only tell the user to
-go approve something once the command has actually been waiting a while.
+up to 10 items per approval. A previously approved request may be reused silently with no
+Telegram prompt at all; `exec` says which happened when it succeeds, so read that line
+before telling the user anything about approvals.
+
+### When exec comes back "尚未批准"
+
+`exec` waits about 100 seconds and then gives up **on the wait, not on the request**
+(exit code 75). The approval card is still live in the Owner's chat, and the broker will
+keep re-sending it for roughly 25 minutes. Nothing was granted and nothing ran.
+
+Do this, in order:
+
+1. Tell the user, in one line, that a card is waiting for them — name the item.
+2. Re-run **the same command** after about 60 seconds. Approval mints the authorization,
+   so a re-run after approval is an ordinary fast path and returns in under a second.
+3. At most three re-runs. Then stop, say the card is still unanswered, and wait for the
+   user.
+
+Never submit a *second* request instead of re-running: re-sending the card is the
+broker's job, and a duplicate request just puts two cards in front of the Owner.
 
 Report the command result or the approval failure. **Never report a credential value.**
 
@@ -211,8 +228,10 @@ they have filled it in. Confirm with `approved-secret list "<item>"` before cont
 - Do not background the broker or poll its internal APIs. One foreground command owns
   start, waiting, timeout, and cancellation.
 - Use `--json` only to parse catalog metadata; catalog output never contains values.
-- If approval is denied or times out, **fail closed**. Do not resend. Retry only when
-  the user asks or is ready to approve.
+- **Denied** means stop for good: fail closed, never resend, report which item was
+  refused, and find another way. **尚未批准** (exit 75) is not a denial — follow the
+  re-run procedure above. If a command reports it cannot confirm the result, re-running
+  is the correct move, not a risk: it may already be approved.
 - **Never weaken, pad, or genericise `--reason`.** If you cannot state a specific
   purpose, you should not be asking.
 - After a network failure on a write, **do not blindly retry**. Run
