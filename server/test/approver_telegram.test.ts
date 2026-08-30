@@ -394,3 +394,71 @@ test("an unrenderable card rejects the request instead of sending a truncated on
   // Nothing was parked or sent.
   expect(fake.sentMessages.length).toBe(0);
 });
+
+// -- Re-push: one live card per window (ADR-0006) ----------------------------
+
+function makeRepushApprover(approvalCards: number): TelegramApprover {
+  const instance = new TelegramApprover(
+    {
+      botToken: "TEST_TOKEN",
+      chatId: "555",
+      allowedUserIds: [ALLOWED_USER],
+      apiBase: fake.url,
+      approvalCards,
+    },
+    { onRevoke: () => null },
+    { log: () => {} },
+  );
+  instance.start();
+  return instance;
+}
+
+test("a window split into cards deletes the standing card and sends a new one", async () => {
+  const repusher = makeRepushApprover(3);
+  try {
+    // 600ms window / 3 cards = a new card roughly every 200ms.
+    const decision = repusher.requestApproval(makeCard(), 600);
+    // The old card is deleted only after the new one lands, so wait on the
+    // delete — waiting on the send alone races the replacement.
+    await waitFor(() => fake.deletedMessageIds.length > 0, 2000);
+
+    // The replacement is a fresh send (it pushes), never an edit of the old one.
+    expect(fake.sentMessages.length).toBeGreaterThanOrEqual(2);
+    expect(fake.sentMessages[1].text).toContain("重新提醒");
+    // The buttons ride on the new card too, or the Owner cannot answer it.
+    expect((fake.sentMessages[1].reply_markup?.inline_keyboard ?? []).flat().length).toBeGreaterThan(0);
+
+    expect(await decision).toEqual({ approved: false, reason: "timeout" });
+  } finally {
+    repusher.stop();
+  }
+});
+
+test("the abandoned window leaves a record instead of an empty chat", async () => {
+  const repusher = makeRepushApprover(2);
+  try {
+    expect(await repusher.requestApproval(makeCard(), 300)).toEqual({ approved: false, reason: "timeout" });
+    await waitFor(() => fake.sentMessages.some((message) => message.text.includes("已放弃")), 2000);
+    // The dead card's buttons are stripped so a late tap cannot look live.
+    expect(fake.editedMarkups.length).toBeGreaterThan(0);
+  } finally {
+    repusher.stop();
+  }
+});
+
+test("a decision on the standing card stops the re-push", async () => {
+  const repusher = makeRepushApprover(5);
+  try {
+    const card = makeCard();
+    const decision = repusher.requestApproval(card, 1000);
+    await waitFor(() => fake.sentMessages.length === 1);
+    fake.pressButton(`ap:${card.id}:approve_8h`, ALLOWED_USER);
+    expect(await decision).toMatchObject({ approved: true, ttl: "8h" });
+
+    const sentAtDecision = fake.sentMessages.length;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(fake.sentMessages.length).toBe(sentAtDecision);
+  } finally {
+    repusher.stop();
+  }
+});

@@ -56,6 +56,7 @@ async function main(): Promise<void> {
         botToken: config.telegram_bot_token,
         chatId: config.telegram_chat_id,
         allowedUserIds: config.telegram_allowed_user_ids,
+        approvalCards: config.approval_cards,
       },
       { onRevoke: (sightingId) => grants.revokeByHandle(sightingId) },
       { log },

@@ -1,8 +1,9 @@
 // Fake Telegram Bot API server for integration tests.
 //
 // Implements just enough of sendMessage / getUpdates / answerCallbackQuery /
-// editMessageReplyMarkup for the TelegramApprover's long-poll loop, including
-// offset-based acknowledgement so updates are never redelivered.
+// editMessageReplyMarkup / deleteMessage for the TelegramApprover's long-poll
+// loop, including offset-based acknowledgement so updates are never
+// redelivered.
 
 export type FakeSentMessage = {
   chat_id: string | number;
@@ -19,6 +20,8 @@ export type FakeTelegram = {
   answeredCallbacks: Array<{ callback_query_id: string; text?: string }>;
   /** Parsed editMessageReplyMarkup bodies in order. */
   editedMarkups: Array<{ chat_id: string | number; message_id: number; reply_markup: unknown }>;
+  /** message_ids passed to deleteMessage, in order. */
+  deletedMessageIds: number[];
   /** Enqueue a callback_query update, delivered by the pending or next getUpdates call. */
   pressButton(callbackData: string, fromUserId: number): void;
   stop(): void;
@@ -30,6 +33,7 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
   const sentMessages: FakeSentMessage[] = [];
   const answeredCallbacks: FakeTelegram["answeredCallbacks"] = [];
   const editedMarkups: FakeTelegram["editedMarkups"] = [];
+  const deletedMessageIds: number[] = [];
 
   type Update = {
     update_id: number;
@@ -108,6 +112,11 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
         return Response.json({ ok: true, result: true });
       }
 
+      if (method === "deleteMessage") {
+        deletedMessageIds.push(Number(body.message_id));
+        return Response.json({ ok: true, result: true });
+      }
+
       if (method === "editMessageReplyMarkup") {
         editedMarkups.push({
           chat_id: body.chat_id as string | number,
@@ -126,6 +135,7 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
     sentMessages,
     answeredCallbacks,
     editedMarkups,
+    deletedMessageIds,
     pressButton(callbackData: string, fromUserId: number): void {
       queue.push({
         update_id: nextUpdateId++,
