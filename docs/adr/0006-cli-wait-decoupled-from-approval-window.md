@@ -56,6 +56,3 @@ Broker's job, and a re-run against an existing Grant is not a new ask.
   a timeout. It means the opposite of the Broker's approval timeout — the
   Request may well have been approved — and the two messages currently read
   almost identically.
-
-Not yet implemented at the time of writing; ARCHITECTURE.md and CONTEXT.md are
-updated when the code lands.

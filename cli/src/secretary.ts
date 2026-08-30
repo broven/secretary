@@ -50,11 +50,16 @@ const EXIT_PENDING_APPROVAL = 75;
 const MAX_REQUEST_BODY_BYTES = 200_000;
 const CATALOG_TIMEOUT_MS = 60_000;
 const MAX_ITEMS = 10;
+/** Mirrors the broker's reserved name (ADR-0007). */
+const HOW_TO_GET_FIELD = "how_to_get";
+const MAX_HOW_TO_GET = 500;
 const EXEC_USAGE =
   "用法：secretary exec --reason \"申请理由\" --item ITEM field=ENV[,field=ENV] [--item ITEM field=ENV ...] -- command...";
 const AUTH_USAGE = "用法：secretary auth import|status|delete|set-url <url>|set-client-id <id>";
 const CREATE_USAGE =
-  '用法：secretary create --item ITEM [--description "用途"] --field NAME=@stdin|@owner [...] --reason "理由"';
+  '用法：secretary create --item ITEM [--description "用途"] [--how-to-get "怎么再拿一份"] --field NAME=@stdin|@owner [...] --reason "理由"';
+const ASK_OWNER_USAGE =
+  '用法：secretary ask-owner --item ITEM [--description "用途"] [--how-to-get "怎么拿到"] --field NAME [...] --reason "理由"';
 const UPDATE_USAGE =
   '用法：secretary update --item ITEM (--field NAME=@stdin [...] | --rename NEW | --description "用途") --reason "理由"';
 const REMOVE_USAGE = '用法：secretary remove --item ITEM [--field NAME] --reason "理由"';
@@ -74,7 +79,14 @@ export function isValidFieldName(value: string): boolean {
 }
 export type Binding = { field: CatalogField; env: string };
 export type CatalogResponse = {
-  items: Array<{ name: string; description: string; fields: CatalogField[]; created_at: string }>;
+  items: Array<{
+    name: string;
+    description: string;
+    fields: CatalogField[];
+    created_at: string;
+    /** How to obtain a fresh copy; "" means not recorded (ADR-0007). */
+    how_to_get: string;
+  }>;
 };
 export type ApprovalResult = {
   approved?: boolean;
@@ -145,6 +157,7 @@ export type ParsedInvocation =
     item: string;
     reason: string;
     description?: string;
+    howToGet?: string;
     rename?: string;
     fields: WriteFieldSpec[];
     removeField?: string;
@@ -162,6 +175,9 @@ function parseSingleBinding(value: string): Binding {
   const field = value.slice(0, separator);
   const env = value.slice(separator + 1);
   if (!isValidFieldName(field)) throw new Error(`无效 binding 字段名：${field}`);
+  if (field === HOW_TO_GET_FIELD) {
+    throw new Error(`${HOW_TO_GET_FIELD} 是条目的获取说明，不是凭证，不能注入环境变量`);
+  }
   if (!ENV_NAME.test(env)) throw new Error(`无效 binding：${value}`);
   if (isReservedEnv(env)) throw new Error(`不能绑定到环境变量：${env}`);
   return { field, env };
@@ -272,11 +288,21 @@ export function parseWriteInvocation(
   operation: WriteOperation,
   cwd: string,
   rest: string[],
+  /**
+   * `ask-owner`: a Create whose every Field is Owner-supplied. A separate verb
+   * because "create" reads as "I am writing a value now", which is the opposite
+   * of what this does — it writes nothing and asks the Owner for the value
+   * (ADR-0007). Fields are bare names here; the caller never spells `@owner`.
+   */
+  askOwner = false,
 ): ParsedInvocation {
-  const usage = operation === "create" ? CREATE_USAGE : operation === "update" ? UPDATE_USAGE : REMOVE_USAGE;
+  const usage = askOwner
+    ? ASK_OWNER_USAGE
+    : operation === "create" ? CREATE_USAGE : operation === "update" ? UPDATE_USAGE : REMOVE_USAGE;
   const { reason, tokens } = extractReason(rest);
   let item: string | undefined;
   let description: string | undefined;
+  let howToGet: string | undefined;
   let rename: string | undefined;
   let removeField: string | undefined;
   const fields: WriteFieldSpec[] = [];
@@ -292,6 +318,10 @@ export function parseWriteInvocation(
         if (description !== undefined) throw new Error("--description 只能给一次");
         description = takeFlagValue(tokens, index++, flag).trim();
         break;
+      case "--how-to-get":
+        if (howToGet !== undefined) throw new Error("--how-to-get 只能给一次");
+        howToGet = takeFlagValue(tokens, index++, flag).trim();
+        break;
       case "--rename":
         if (rename !== undefined) throw new Error("--rename 只能给一次");
         rename = takeFlagValue(tokens, index++, flag).trim();
@@ -302,6 +332,11 @@ export function parseWriteInvocation(
           if (removeField !== undefined) throw new Error("remove 的 --field 只能给一次");
           if (!isValidFieldName(value)) throw new Error(`无效字段名：${value}`);
           removeField = value;
+          break;
+        }
+        if (askOwner) {
+          if (!isValidFieldName(value)) throw new Error(`无效字段名：${value}`);
+          fields.push({ name: value, source: "owner" });
           break;
         }
         fields.push(parseWriteFieldSpec(value));
@@ -321,8 +356,14 @@ export function parseWriteInvocation(
     names.add(field.name);
   }
 
+  if (howToGet !== undefined) {
+    if (!howToGet) throw new Error("--how-to-get 不能是空串：不知道就整个不要给");
+    if (howToGet.length > MAX_HOW_TO_GET) throw new Error(`--how-to-get 最多 ${MAX_HOW_TO_GET} 个字符`);
+  }
   if (operation === "create") {
-    if (fields.length === 0) throw new Error(`create 至少要一个 --field\n${CREATE_USAGE}`);
+    if (fields.length === 0) {
+      throw new Error(askOwner ? `ask-owner 至少要一个 --field\n${ASK_OWNER_USAGE}` : `create 至少要一个 --field\n${CREATE_USAGE}`);
+    }
     if (rename !== undefined) throw new Error("create 不接受 --rename");
   } else if (operation === "update") {
     // @owner is create-only: the lane that skips an Approval may only add.
@@ -333,15 +374,22 @@ export function parseWriteInvocation(
         "或者自己去 vault 客户端里改。",
       );
     }
-    const intents = [rename !== undefined, description !== undefined, fields.length > 0].filter(Boolean).length;
+    const intents = [
+      rename !== undefined,
+      description !== undefined,
+      howToGet !== undefined,
+      fields.length > 0,
+    ].filter(Boolean).length;
     if (intents === 0) throw new Error(UPDATE_USAGE);
-    if (intents > 1) throw new Error("update 一次只能改一类东西：字段值、条目名、描述，请分开提交");
+    if (intents > 1) throw new Error("update 一次只能改一类东西：字段值、条目名、描述、获取方式，请分开提交");
   } else {
     if (fields.length > 0) throw new Error("remove 的 --field 只写字段名，不带 =");
-    if (rename !== undefined || description !== undefined) throw new Error(REMOVE_USAGE);
+    if (rename !== undefined || description !== undefined || howToGet !== undefined) {
+      throw new Error(REMOVE_USAGE);
+    }
   }
 
-  return { action: "write", cwd, operation, item, reason, description, rename, fields, removeField };
+  return { action: "write", cwd, operation, item, reason, description, howToGet, rename, fields, removeField };
 }
 
 const AUTH_ACTIONS_NO_VALUE: AuthAction[] = ["import", "status", "delete"];
@@ -376,6 +424,7 @@ export function parseInvocation(args: string[]): ParsedInvocation {
   if (action === "create" || action === "update" || action === "remove") {
     return parseWriteInvocation(action, cwd, rest);
   }
+  if (action === "ask-owner") return parseWriteInvocation("create", cwd, rest, true);
   if (action === "exec") {
     const separator = rest.indexOf("--");
     if (separator < 0 || separator === rest.length - 1) throw new Error(EXEC_USAGE);
@@ -385,7 +434,7 @@ export function parseInvocation(args: string[]): ParsedInvocation {
     if (command.some((part) => part.length > MAX_ARGV_ENTRY_LENGTH)) throw new Error("命令参数过长");
     return { action, cwd, items: parseItemGroups(tokens), command, reason };
   }
-  throw new Error("用法：secretary list|exec|create|update|remove|auth ...（--version 查看版本）");
+  throw new Error("用法：secretary list|exec|create|ask-owner|update|remove|auth ...（--version 查看版本）");
 }
 
 function parseJson(text: string, context: string): unknown {
@@ -415,6 +464,7 @@ export function parseCatalogResponse(value: unknown): CatalogResponse {
       description: typeof item.description === "string" ? item.description.trim().slice(0, 1000) : "",
       fields: fields.sort(),
       created_at: typeof item.created_at === "string" ? item.created_at.trim().slice(0, 100) : "",
+      how_to_get: typeof item.how_to_get === "string" ? item.how_to_get.trim().slice(0, 500) : "",
     };
   });
   return { items };
@@ -764,11 +814,12 @@ async function validateApprovalResult(
 }
 
 function formatCatalog(catalog: CatalogResponse): string {
-  const headers = ["NAME", "FIELDS", "DESCRIPTION", "CREATED_AT"];
+  const headers = ["NAME", "FIELDS", "DESCRIPTION", "HOW_TO_GET", "CREATED_AT"];
   const rows = catalog.items.map((item) => [
     item.name,
     item.fields.join(","),
     item.description || "-",
+    item.how_to_get || "-",
     item.created_at || "-",
   ]
     .map((value) => value.replace(/[\u0000-\u001f\u007f]/g, " ")));
@@ -914,6 +965,7 @@ async function runWrite(
     user: deps.username().slice(0, 200),
     agent: "code-agent",
     ...(invocation.description !== undefined ? { description: invocation.description } : {}),
+    ...(invocation.howToGet !== undefined ? { how_to_get: invocation.howToGet } : {}),
     ...(invocation.rename !== undefined ? { rename: invocation.rename } : {}),
     ...(invocation.fields.length ? { fields: invocation.fields } : {}),
     ...(values ? { values } : {}),

@@ -36,8 +36,8 @@ Shape, and why each part is not obvious:
   holding credentials with different origins, at the cost of a field per
   credential and a prefix-matching reserved-name rule.
 - **A plain-text custom field (`type: 0`), not hidden (`type: 1`).** The write
-  path currently hardcodes hidden; this is not a secret and must be readable in
-  an ordinary vault client.
+  path stores credentials as hidden by default; this is not a credential and
+  must be readable in an ordinary vault client.
 - **Excluded from the catalog's field list, and reserved against binding.** It
   travels in the same array as real credentials, so without this an agent could
   `exec --item X how_to_get=SOMETHING` and inject it as though it were one.
@@ -69,6 +69,3 @@ Shape, and why each part is not obvious:
 - `ENTRY_TTL_S` rises from 600 s to 1800 s. The Owner now routinely opens the
   Entry Form, follows the How-to-get to a console, generates the credential, and
   comes back — ten minutes was budgeted for typing a value that already existed.
-
-Not yet implemented at the time of writing; ARCHITECTURE.md and CONTEXT.md are
-updated when the code lands.

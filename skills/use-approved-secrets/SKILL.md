@@ -30,7 +30,8 @@ to the secretary broker, which is the only thing that ever holds plaintext. You 
 
 - **read** the safe catalog (`list`) and run one command with secrets injected (`exec`);
 - **write** to the vault (`create` / `update` / `remove`), each write approved by the
-  Owner from Telegram.
+  Owner from Telegram;
+- **ask** the Owner for a credential you must not see (`ask-owner`).
 
 You never see a credential value. Reads inject into a child process's environment;
 writes take values from stdin or from the Owner directly.
@@ -124,6 +125,25 @@ Values never appear in argv. A field's value comes from exactly one of:
 - `@owner` — the value must not enter your context; the Owner types it into a one-time
   web form. **Only `create` may use `@owner`.**
 
+### ask-owner — you need a credential you must not see
+
+Use this the moment you need a credential you do not have. It writes **nothing** and
+reveals nothing: it prints a one-time link and exits. Running it is always safe, so
+**do not ask permission first, and do not hand the command to the user to run.**
+
+```bash
+approved-secret ask-owner --item "Linear API" \
+  --description "Linear Personal API Key，直接调 GraphQL API 用" \
+  --how-to-get "Linear → Settings → Security & access → Personal API keys → New key" \
+  --field api_key \
+  --reason "要直接调 Linear GraphQL API，vault 里没有可用的 key"
+```
+
+Fields are bare names — no `=@owner`. **Pick the item name and description yourself**;
+they are yours to decide, and a name you regret costs one `update --rename` later. Ask
+the user only when you genuinely cannot tell what the credential is *for* — not to have
+a name approved.
+
 ### create — a new item, or a new field on an existing item
 
 ```bash
@@ -147,6 +167,14 @@ USERNAME_VALUE="ops@acme.com" jq -n '{username: env.USERNAME_VALUE}' | \
     --field username=@stdin --field password=@owner \
     --reason "注册完账号，密码由本人设置"
 ```
+
+**`--how-to-get` records where the credential comes from.** Optional, and never
+fabricated: write it when you know (you usually do — you are the one proposing this
+credential, and you generally named the console page it comes from), leave the flag off
+entirely when you do not. "Get it from the official site" is worse than nothing, because
+it reads as knowledge. It is shown to the Owner on the approval card and on the entry
+form, and to future agents in `list`. It is documentation, not a credential: it can
+never be a `--field` name and can never be bound to an environment variable.
 
 **`--description` is the intent switch.** With it you are creating a new item, and a
 name that is already taken is an **error**. Without it you are adding fields to an item
@@ -178,7 +206,8 @@ approved-secret update --item "Acme Prod" --description "Acme 生产部署账号
 ```
 
 One `update` changes **one kind of thing** — field values, or the name, or the
-description. Not two at once.
+description, or the how-to-get. Not two at once. Updating the how-to-get is worth doing
+whenever you notice the acquisition path has changed (a console redesign, a moved menu).
 
 If the vault already holds the value you are asking for, the command succeeds as
 "unchanged" and the Owner is not disturbed. That is what makes a retry safe.
@@ -193,6 +222,8 @@ approved-secret remove --item "Acme Prod" --reason "服务已下线，条目不�
 approved-secret remove --item "Acme Prod" --field api_key --reason "这个 key 已作废撤销"
 ```
 
+- `how_to_get` cannot be removed. Correct it with `update --how-to-get` instead — a
+  stale acquisition path is still better than none.
 - Removing an **item** puts it in the vault's trash — recoverable.
 - Removing a **field** is **irreversible**: the vault keeps no history for fields.
 - Either way, existing authorizations for what was removed are revoked. Restoring an
@@ -236,8 +267,8 @@ they have filled it in. Confirm with `approved-secret list "<item>"` before cont
   purpose, you should not be asking.
 - After a network failure on a write, **do not blindly retry**. Run
   `approved-secret list "<item>"` first: the write may already have landed.
-- If a credential you need is absent, say what catalog entry is needed. Creating it is a
-  deliberate `create`, with a real description — not a guess.
+- If a credential you need is absent, do not stop and describe what is missing — run
+  `ask-owner` and give the user the link. Naming the item is your call, not theirs.
 
 Token setup is a human-only bootstrap action. If the command reports that no token is
 configured, ask the user to run `approved-secret auth import`; never request or accept
