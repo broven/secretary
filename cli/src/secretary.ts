@@ -42,8 +42,15 @@ const HEADER_TIMEOUT_MS = 30_000;
  * ambiguity this wait exists to remove. Giving up costs nothing: the Request
  * stays parked, the Owner still has a live card, and approving it mints the
  * Grant that makes the re-run a fast path.
+ *
+ * Measured against a live broker, not just the fakes: this clock starts when
+ * the response headers arrive, so anything the server spends before its first
+ * byte is added on top. 100 s here plus a 20 s pre-header pause came to 121 s
+ * against a 120 s default harness timeout — the bug, restored, with a 1 s
+ * margin. The server now flushes immediately; this number keeps the margin
+ * even if it ever stops.
  */
-const APPROVAL_WAIT_MS = 100_000;
+const APPROVAL_WAIT_MS = 75_000;
 /** Exit code for "the Owner has not answered yet" — distinct from a real failure. */
 const EXIT_PENDING_APPROVAL = 75;
 // The broker rejects bodies over 256 KiB; leave headroom for encoding.
