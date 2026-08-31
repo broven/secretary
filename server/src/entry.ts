@@ -27,6 +27,8 @@ export type EntryDraft<T> = {
   expires_at: number;
   item: string;
   description: string;
+  /** The Item's How-to-get, shown so the Owner can go and obtain the value. */
+  how_to_get?: string;
   /** Fields the Owner must fill, in display order. */
   owner_fields: SecretField[];
   /** Fields the agent already supplied — names only, shown so the Owner can
@@ -117,6 +119,19 @@ export function escapeHtml(value: unknown): string {
     .replaceAll("'", "&#39;");
 }
 
+/**
+ * Render agent-authored prose (a How-to-get) for a page that also collects a
+ * secret. No markdown library and no raw HTML: escape everything, keep line
+ * breaks, and turn bare http(s) URLs into links. Anything script-bearing was
+ * already refused at write time (ADR-0007); this is the second wall.
+ */
+export function renderProse(value: string): string {
+  return escapeHtml(value)
+    .replace(/https?:\/\/[^\s<&"']+/g, (url) =>
+      `<a href="${url}" rel="noopener noreferrer nofollow" target="_blank">${url}</a>`)
+    .replaceAll("\n", "<br>");
+}
+
 const STYLE = `
 :root { color-scheme: light dark; }
 body { margin:0; padding:2rem 1rem; font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
@@ -136,6 +151,10 @@ input[type=password] { width:100%; box-sizing:border-box; padding:.6rem .7rem; f
 button { width:100%; padding:.7rem; font-size:1rem; font-weight:600; border:0; border-radius:8px;
   background:#2f6feb; color:#fff; cursor:pointer; }
 .note { margin-top:1rem; font-size:.82rem; opacity:.65; }
+.howto { margin:0 0 1.25rem; padding:.7rem .85rem; border-radius:8px; font-size:.88rem;
+  background:#eef3fb; border:1px solid #d3e0f5; word-break:break-word; }
+@media (prefers-color-scheme: dark) { .howto { background:#1d2635; border-color:#2c3a52; } }
+.howto b { display:block; margin-bottom:.25rem; opacity:.7; font-weight:600; }
 .bad { color:#b3261e; } .good { color:#1a7f37; }
 `.trim();
 
@@ -168,6 +187,9 @@ export function renderEntryPage(draft: EntryDraft<unknown>, error?: string): str
       ${draft.description ? `<dt>描述</dt><dd>${escapeHtml(draft.description)}</dd>` : ""}
       ${supplied}
     </dl>
+    ${draft.how_to_get
+      ? `<div class="howto"><b>怎么拿到这个值</b>${renderProse(draft.how_to_get)}</div>`
+      : ""}
     <form method="post" autocomplete="off">
       ${inputs}
       <button type="submit">写入 vault</button>

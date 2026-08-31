@@ -31,6 +31,8 @@ import {
   type WriteResult,
 } from "./types.ts";
 import {
+  HOW_TO_GET_FIELD,
+  howToGetOf,
   isValidFieldName,
   itemFieldValue,
   type BwItem,
@@ -96,6 +98,8 @@ export type ParsedWrite = {
   user: string;
   agent: string;
   description?: string;
+  /** Best effort and never required (ADR-0007): absent means "not recorded". */
+  how_to_get?: string;
   rename?: string;
   fields: ParsedWriteField[];
   values: Map<SecretField, string>;
@@ -105,6 +109,14 @@ export type ParsedWrite = {
 
 const MIN_REASON = 10;
 const MAX_REASON = 2000;
+const MAX_HOW_TO_GET = 500;
+/**
+ * How-to-get is agent-authored prose that ends up rendered on the Entry Form —
+ * the very page that collects a secret — so markup and script-bearing URL
+ * schemes are refused at the door rather than sanitized on the way out
+ * (ADR-0007). Everything downstream may then treat it as plain text.
+ */
+const HOW_TO_GET_FORBIDDEN = /<|javascript:|data:/i;
 
 function text(value: unknown, field: string, max: number, required: boolean): string {
   const out = String(value ?? "").trim();
@@ -132,6 +144,17 @@ function assertDescription(value: unknown): string {
   return description;
 }
 
+function assertHowToGet(value: unknown): string {
+  const text = String(value ?? "").trim();
+  if (!text) throw new WriteError("how_to_get 不能为空字符串：不知道就整个不要传");
+  if (text.length > MAX_HOW_TO_GET) throw new WriteError(`how_to_get 最多 ${MAX_HOW_TO_GET} 个字符`);
+  if (CONTROL_CHARS_ALLOW_WRAP.test(text)) throw new WriteError("how_to_get invalid");
+  if (HOW_TO_GET_FORBIDDEN.test(text)) {
+    throw new WriteError("how_to_get 只收纯文本：不要写标签或 javascript:/data: URL");
+  }
+  return text;
+}
+
 function parseFields(value: unknown, operation: WriteOperation): ParsedWriteField[] {
   if (value === undefined) return [];
   if (!Array.isArray(value) || value.length > MAX_WRITE_FIELDS) throw new WriteError("fields invalid");
@@ -143,6 +166,12 @@ function parseFields(value: unknown, operation: WriteOperation): ParsedWriteFiel
     // never on the failing branch.
     const shown = name.slice(0, 32);
     if (!isValidFieldName(name)) throw new WriteError(`field name invalid: ${shown}`);
+    // Reserved: it rides in the same array as credentials but is documentation
+    // (ADR-0007). Letting it in here would put agent prose behind a Fingerprint
+    // and make it bindable as a secret.
+    if (name === HOW_TO_GET_FIELD) {
+      throw new WriteError(`${HOW_TO_GET_FIELD} 是条目的获取说明，不是凭证字段；请用 --how-to-get`);
+    }
     if (seen.has(name)) throw new WriteError(`field listed twice: ${name}`);
     seen.add(name);
     const source = raw?.source;
@@ -207,6 +236,7 @@ export function parseWriteBody(value: unknown): ParsedWrite {
   };
 
   if (body.description !== undefined) parsed.description = assertDescription(body.description);
+  if (body.how_to_get !== undefined) parsed.how_to_get = assertHowToGet(body.how_to_get);
   if (body.rename !== undefined) parsed.rename = assertItemName(body.rename);
   if (body.field !== undefined) {
     const field = String(body.field);
@@ -225,14 +255,24 @@ export function parseWriteBody(value: unknown): ParsedWrite {
     const intents = [
       parsed.rename !== undefined,
       parsed.description !== undefined,
+      parsed.how_to_get !== undefined,
       parsed.fields.length > 0,
     ].filter(Boolean).length;
-    if (intents === 0) throw new WriteError("update 需要 --field / --rename / --description 之一");
-    if (intents > 1) throw new WriteError("update 一次只能改一类东西：字段值、条目名、描述，请分开提交");
+    if (intents === 0) {
+      throw new WriteError("update 需要 --field / --rename / --description / --how-to-get 之一");
+    }
+    if (intents > 1) {
+      throw new WriteError("update 一次只能改一类东西：字段值、条目名、描述、获取方式，请分开提交");
+    }
   } else {
     if (parsed.fields.length > 0) throw new WriteError("remove 不接受 --field NAME=…");
     if (parsed.rename !== undefined) throw new WriteError("remove 不接受 --rename");
     if (parsed.description !== undefined) throw new WriteError("remove 不接受 --description");
+    if (parsed.how_to_get !== undefined) throw new WriteError("remove 不接受 --how-to-get");
+    // A stale acquisition path beats none, and it is not a credential to revoke.
+    if (parsed.field === HOW_TO_GET_FIELD) {
+      throw new WriteError(`${HOW_TO_GET_FIELD} 不能删除；要改就用 update --how-to-get`);
+    }
   }
   return parsed;
 }
@@ -247,6 +287,7 @@ export function newLoginItemPayload(
   name: string,
   description: string,
   values: Map<SecretField, string>,
+  howToGet?: string,
 ): Record<string, unknown> {
   const item: Record<string, unknown> = {
     organizationId: null,
@@ -261,6 +302,7 @@ export function newLoginItemPayload(
     reprompt: 0,
   };
   for (const [field, value] of values) setItemField(item as BwItem, field, value);
+  if (howToGet) setItemNoteField(item as BwItem, HOW_TO_GET_FIELD, howToGet);
   return item;
 }
 
@@ -285,6 +327,23 @@ export function setItemField(item: BwItem, field: SecretField, value: string): v
     // Hidden, not text: a credential should not be legible over the Owner's
     // shoulder in the vault UI by default.
     fields.push({ name: field, value, type: 1 });
+  }
+  target.fields = fields;
+}
+
+/**
+ * Set a non-secret note field: type 0 (text), not 1 (hidden). A How-to-get is
+ * documentation and must be legible in an ordinary vault client (ADR-0007).
+ */
+export function setItemNoteField(item: BwItem, field: string, value: string): void {
+  const target = item as Record<string, unknown>;
+  const fields = Array.isArray(item.fields) ? item.fields : [];
+  const existing = fields.find((entry) => entry?.name === field && (entry.type === 0 || entry.type === 1));
+  if (existing) {
+    existing.value = value;
+    existing.type = 0;
+  } else {
+    fields.push({ name: field, value, type: 0 });
   }
   target.fields = fields;
 }
@@ -455,6 +514,9 @@ export class WriteBroker {
       ...(parsed.description !== undefined
         ? [{ label: "描述", value: parsed.description, plain: true } as WriteCardLine]
         : []),
+      ...(parsed.how_to_get !== undefined
+        ? [{ label: "获取方式", value: parsed.how_to_get, plain: true } as WriteCardLine]
+        : []),
       ...parsed.fields.map((field) => ({
         label: `字段 ${field.name}`,
         value: fingerprint(parsed.values.get(field.name)!),
@@ -489,11 +551,14 @@ export class WriteBroker {
     values: Map<SecretField, string>,
   ): Promise<void> {
     if (!existing) {
-      await this.deps.vault.createItem(newLoginItemPayload(parsed.item, parsed.description ?? "", values));
+      await this.deps.vault.createItem(
+        newLoginItemPayload(parsed.item, parsed.description ?? "", values, parsed.how_to_get),
+      );
       return;
     }
     const draft = cloneItem(existing.raw);
     for (const [field, value] of values) setItemField(draft, field, value);
+    if (parsed.how_to_get) setItemNoteField(draft, HOW_TO_GET_FIELD, parsed.how_to_get);
     await this.deps.vault.replaceItem(existing.item_id, draft);
   }
 
@@ -510,6 +575,7 @@ export class WriteBroker {
       expires_at: expiresAt,
       item: parsed.item,
       description: parsed.description ?? existing?.description ?? "",
+      how_to_get: parsed.how_to_get ?? (existing ? howToGetOf(existing.raw) : ""),
       owner_fields: ownerFields,
       inline_fields: parsed.fields.filter((f) => f.source === "inline").map((f) => f.name),
       payload: { parsed, client, existing_item_id: existing?.item_id ?? null },
@@ -596,6 +662,7 @@ export class WriteBroker {
 
     if (parsed.rename !== undefined) return this.updateRename(parsed, client, existing);
     if (parsed.description !== undefined) return this.updateDescription(parsed, client, existing);
+    if (parsed.how_to_get !== undefined) return this.updateHowToGet(parsed, client, existing);
     return this.updateValues(parsed, client, existing);
   }
 
@@ -660,6 +727,35 @@ export class WriteBroker {
       await this.deps.vault.replaceItem(existing.item_id, draft);
     }
     return { status: "applied", operation: "update", item: parsed.item, detail: "已更新描述" };
+  }
+
+  private async updateHowToGet(
+    parsed: ParsedWrite,
+    client: AuthedClient,
+    existing: VaultItemSnapshot,
+  ): Promise<WriteResult> {
+    const target = parsed.how_to_get!;
+    const current = howToGetOf(existing.raw);
+    if (current === target) {
+      return { status: "unchanged", operation: "update", item: parsed.item, detail: "获取方式已经是目标值" };
+    }
+    // Not a credential: the Owner sees the real diff, which is also the only
+    // thing standing between the vault and a plausible-sounding invention.
+    const card = this.card(parsed, client, "update_how_to_get", [
+      { label: "现获取方式", value: current || "（未记录）", plain: true },
+      { label: "新获取方式", value: target, plain: true },
+    ], []);
+    const decision = await this.decide(card);
+    if (!decision.ok) return decision.result;
+
+    const latest = await this.latestItemForApply(parsed.item, existing.item_id);
+    if (howToGetOf(latest.raw) !== target) {
+      if (howToGetOf(latest.raw) !== current) throw changedDuringApproval(parsed.item, "获取方式");
+      const draft = cloneItem(latest.raw);
+      setItemNoteField(draft, HOW_TO_GET_FIELD, target);
+      await this.deps.vault.replaceItem(existing.item_id, draft);
+    }
+    return { status: "applied", operation: "update", item: parsed.item, detail: "已更新获取方式" };
   }
 
   private async updateValues(

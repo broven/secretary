@@ -17,6 +17,7 @@ export type BrokerConfig = {
   approval_timeout_s: number;
   /** How long an Entry Form link stays usable. The link IS the capability
    * (ADR-0004), so this window is the main thing bounding a leaked one. */
+  approval_cards: number;
   entry_ttl_s: number;
   sync_max_age_s: number;
   db_path: string;
@@ -24,10 +25,19 @@ export type BrokerConfig = {
   dev_auto_approve: boolean;
 };
 
-export const DEFAULT_APPROVAL_TIMEOUT_S = 300;
-export const MAX_APPROVAL_TIMEOUT_S = 600;
+// The total window a Request stays parked, across every card the Owner is sent
+// (ADR-0006). It is deliberately far longer than any agent will wait: the CLI
+// gives up early and tells its caller to re-run, while the Owner keeps a live
+// card in the chat.
+export const DEFAULT_APPROVAL_TIMEOUT_S = 1500;
+export const MAX_APPROVAL_TIMEOUT_S = 3600;
+/** How many cards that window is split into; each replaces the one before it. */
+export const DEFAULT_APPROVAL_CARDS = 5;
+export const MAX_APPROVAL_CARDS = 20;
 export const DEFAULT_SYNC_MAX_AGE_S = 60;
-export const DEFAULT_ENTRY_TTL_S = 600;
+// The Owner routinely follows an Item's How-to-get to a console, generates the
+// credential, and only then fills the form (ADR-0007).
+export const DEFAULT_ENTRY_TTL_S = 1800;
 export const MAX_ENTRY_TTL_S = 3600;
 
 export type Env = Record<string, string | undefined>;
@@ -142,6 +152,13 @@ export function loadConfig(env: Env = process.env): BrokerConfig {
       DEFAULT_APPROVAL_TIMEOUT_S,
       1,
       MAX_APPROVAL_TIMEOUT_S,
+    ),
+    approval_cards: parseBoundedInt(
+      (env.APPROVAL_CARDS ?? "").trim(),
+      "APPROVAL_CARDS",
+      DEFAULT_APPROVAL_CARDS,
+      1,
+      MAX_APPROVAL_CARDS,
     ),
     entry_ttl_s: parseBoundedInt(
       (env.ENTRY_TTL_S ?? "").trim(),

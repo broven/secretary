@@ -298,6 +298,7 @@ describe("self-contained secretary client", () => {
       description: "给测试命令使用",
       fields: ["password"],
       created_at: "2026-08-21T08:09:10.000Z",
+      how_to_get: "",
     });
     expect(JSON.stringify(parseCatalogResponse(CATALOG_RESPONSE))).not.toContain("must-never-leak");
     // Custom field names are now legal catalog fields…
@@ -322,6 +323,7 @@ describe("self-contained secretary client", () => {
       description: "给测试命令使用",
       fields: ["password"],
       created_at: "2026-08-21T08:09:10.000Z",
+      how_to_get: "",
     });
   });
 
@@ -433,12 +435,34 @@ describe("self-contained secretary client", () => {
     expect(context.stderr.join("")).toContain("无法解密");
   });
 
-  test("prints the reuse notice when the server reused a standing grant", async () => {
-    const context = makeDeps({ resultExtras: { grant_reused: true } });
+  test("says which path a success took, so the fast path is legible", async () => {
+    const reused = makeDeps({ resultExtras: { grant_reused: true } });
     expect(await main([
       "--cwd", "/repo", "exec", "--reason", "给 CI 补一个 release tag", "--item", "Example API", "password=EXAMPLE_TOKEN", "--", "tool",
-    ], context.deps)).toBe(7);
-    expect(context.stderr.join("")).toContain("复用");
+    ], reused.deps)).toBe(7);
+    expect(reused.stderr.join("")).toContain("命中已有授权");
+
+    const approved = makeDeps();
+    expect(await main([
+      "--cwd", "/repo", "exec", "--reason", "给 CI 补一个 release tag", "--item", "Example API", "password=EXAMPLE_TOKEN", "--", "tool",
+    ], approved.deps)).toBe(7);
+    expect(approved.stderr.join("")).toContain("经 Owner 审批通过");
+  });
+
+  test("giving up on the wait is reported as pending, not as a failure", async () => {
+    const context = makeDeps();
+    context.deps.fetch = (async () => {
+      throw Object.assign(new Error("aborted"), { name: "TimeoutError" });
+    }) as typeof fetch;
+    // Distinct exit code: "not answered yet" must not read as a broken command.
+    expect(await main([
+      "--cwd", "/repo", "exec", "--reason", "给 CI 补一个 release tag", "--item", "Example API", "password=EXAMPLE_TOKEN", "--", "tool",
+    ], context.deps)).toBe(75);
+    expect(context.spawns).toHaveLength(0);
+    const message = context.stderr.join("");
+    expect(message).toContain("尚未批准");
+    expect(message).toContain("重跑");
+    expect(message).toContain(uuid(1));
   });
 
   test("decrypts only with the per-request in-memory private key", async () => {
@@ -478,12 +502,14 @@ describe("self-contained secretary client", () => {
           description: "给测试命令使用",
           fields: ["password"],
           created_at: "2026-08-21T08:09:10.000Z",
+          how_to_get: "",
         },
         {
           name: "Other API",
           description: "第二个测试条目",
           fields: ["password", "username"],
           created_at: "2025-01-02T03:04:05.000Z",
+          how_to_get: "",
         },
       ],
     });
@@ -563,7 +589,10 @@ describe("self-contained secretary client", () => {
     expect(calls).toBe(1);
     expect(context.spawns).toHaveLength(0);
     const message = context.stderr.join("");
-    expect(message).toContain("不会自动重发");
+    // An interrupted connection may mean the Owner already approved, so the
+    // message must not call itself a timeout — re-running is how you find out.
+    expect(message).toContain("无法确认本次审批结果");
+    expect(message).not.toContain("超时");
     expect(message).toContain(uuid(1));
   });
 
@@ -724,5 +753,74 @@ describe("review fixes", () => {
       "--cwd", "/repo", "exec", "--reason", "给 CI 补一个 release tag",
       "--item", "Example API", "password=EXAMPLE_TOKEN", "--", "tool",
     ], context.deps)).toBe(7);
+  });
+});
+
+// -- How-to-get and ask-owner (ADR-0007) -------------------------------------
+
+describe("how-to-get and ask-owner", () => {
+  test("ask-owner is a create whose every field is Owner-supplied", () => {
+    const parsed = parseInvocation([
+      "--cwd", "/repo", "ask-owner", "--item", "Acme Prod",
+      "--description", "Acme 生产部署账号",
+      "--how-to-get", "去 https://acme.example/settings/tokens 用 ops 账号新建一个 deploy token",
+      "--field", "password", "--field", "api_key",
+      "--reason", "刚注册完 Acme，凭据由本人录入",
+    ]);
+    expect(parsed).toMatchObject({
+      action: "write",
+      operation: "create",
+      item: "Acme Prod",
+      howToGet: "去 https://acme.example/settings/tokens 用 ops 账号新建一个 deploy token",
+    });
+    // The caller never spells @owner: bare names, so the verb carries the intent.
+    expect((parsed as { fields: Array<{ name: string; source: string }> }).fields)
+      .toEqual([{ name: "password", source: "owner" }, { name: "api_key", source: "owner" }]);
+  });
+
+  test("how_to_get is documentation and can never be bound as a credential", () => {
+    expect(() => parseInvocation([
+      "--cwd", "/repo", "exec", "--reason", "想读一下这个条目的获取说明文字", "--item", "Acme Prod",
+      "how_to_get=ACME_HOWTO", "--", "tool",
+    ])).toThrow("不是凭证");
+  });
+
+  test("how_to_get is never required, and an empty one is refused as a non-answer", () => {
+    // Absent is fine: not knowing is an honest answer (ADR-0007).
+    expect(parseInvocation([
+      "--cwd", "/repo", "create", "--item", "Acme Prod", "--description", "Acme 生产部署账号",
+      "--field", "password=@stdin", "--reason", "把刚拿到的凭据存进 vault",
+    ])).toMatchObject({ howToGet: undefined });
+    // Empty is not: it is the shape of a caller pretending to have answered.
+    expect(() => parseInvocation([
+      "--cwd", "/repo", "create", "--item", "Acme Prod", "--description", "Acme 生产部署账号",
+      "--how-to-get", "   ", "--field", "password=@stdin", "--reason", "把刚拿到的凭据存进 vault",
+    ])).toThrow("不能是空串");
+  });
+
+  test("update changes one kind of thing, and how-to-get is one of them", () => {
+    expect(parseInvocation([
+      "--cwd", "/repo", "update", "--item", "Acme Prod",
+      "--how-to-get", "后台改版了，现在在 Settings → Developer → Tokens",
+      "--reason", "获取路径变了，同步说明",
+    ])).toMatchObject({ operation: "update", howToGet: "后台改版了，现在在 Settings → Developer → Tokens" });
+    expect(() => parseInvocation([
+      "--cwd", "/repo", "update", "--item", "Acme Prod", "--description", "新描述",
+      "--how-to-get", "新获取方式", "--reason", "一次改两样东西看看会不会被拒",
+    ])).toThrow("一次只能改一类东西");
+  });
+
+  test("the catalog carries how_to_get as its own attribute, not as a field", () => {
+    const catalog = parseCatalogResponse({
+      items: [{
+        name: "Acme Prod",
+        description: "Acme 生产部署账号",
+        fields: ["password"],
+        created_at: "2026-08-21T08:09:10.000Z",
+        how_to_get: "去 https://acme.example/settings/tokens 新建",
+      }],
+    });
+    expect(catalog.items[0].fields).toEqual(["password"]);
+    expect(catalog.items[0].how_to_get).toBe("去 https://acme.example/settings/tokens 新建");
   });
 });

@@ -32,21 +32,34 @@ const RESERVED_ENV = new Set([
 ]);
 const RESERVED_PREFIXES = ["SECRETARY_", "WMILL_", "FNOX_", "SENV_", "BW_", "MISE_", "APPROVED_SECRET_"];
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
-// Headers of the long poll arrive immediately; the body deadline is derived
-// from the server-advertised approval timeout (X-Secretary-Approval-Timeout)
-// plus this margin, so the client always outlives the server-side window.
+// Headers of the long poll arrive immediately.
 const HEADER_TIMEOUT_MS = 30_000;
-const DEFAULT_APPROVAL_TIMEOUT_S = 300;
-const BODY_TIMEOUT_MARGIN_MS = 30_000;
+/**
+ * How long this process waits for a decision before giving up and telling its
+ * caller to re-run (ADR-0006). It is deliberately far below the broker's
+ * approval window, and below every agent harness's default command timeout —
+ * a command killed by the harness reports nothing at all, which is exactly the
+ * ambiguity this wait exists to remove. Giving up costs nothing: the Request
+ * stays parked, the Owner still has a live card, and approving it mints the
+ * Grant that makes the re-run a fast path.
+ */
+const APPROVAL_WAIT_MS = 100_000;
+/** Exit code for "the Owner has not answered yet" — distinct from a real failure. */
+const EXIT_PENDING_APPROVAL = 75;
 // The broker rejects bodies over 256 KiB; leave headroom for encoding.
 const MAX_REQUEST_BODY_BYTES = 200_000;
 const CATALOG_TIMEOUT_MS = 60_000;
 const MAX_ITEMS = 10;
+/** Mirrors the broker's reserved name (ADR-0007). */
+const HOW_TO_GET_FIELD = "how_to_get";
+const MAX_HOW_TO_GET = 500;
 const EXEC_USAGE =
   "用法：secretary exec --reason \"申请理由\" --item ITEM field=ENV[,field=ENV] [--item ITEM field=ENV ...] -- command...";
 const AUTH_USAGE = "用法：secretary auth import|status|delete|set-url <url>|set-client-id <id>";
 const CREATE_USAGE =
-  '用法：secretary create --item ITEM [--description "用途"] --field NAME=@stdin|@owner [...] --reason "理由"';
+  '用法：secretary create --item ITEM [--description "用途"] [--how-to-get "怎么再拿一份"] --field NAME=@stdin|@owner [...] --reason "理由"';
+const ASK_OWNER_USAGE =
+  '用法：secretary ask-owner --item ITEM [--description "用途"] [--how-to-get "怎么拿到"] --field NAME [...] --reason "理由"';
 const UPDATE_USAGE =
   '用法：secretary update --item ITEM (--field NAME=@stdin [...] | --rename NEW | --description "用途") --reason "理由"';
 const REMOVE_USAGE = '用法：secretary remove --item ITEM [--field NAME] --reason "理由"';
@@ -66,7 +79,14 @@ export function isValidFieldName(value: string): boolean {
 }
 export type Binding = { field: CatalogField; env: string };
 export type CatalogResponse = {
-  items: Array<{ name: string; description: string; fields: CatalogField[]; created_at: string }>;
+  items: Array<{
+    name: string;
+    description: string;
+    fields: CatalogField[];
+    created_at: string;
+    /** How to obtain a fresh copy; "" means not recorded (ADR-0007). */
+    how_to_get: string;
+  }>;
 };
 export type ApprovalResult = {
   approved?: boolean;
@@ -137,6 +157,7 @@ export type ParsedInvocation =
     item: string;
     reason: string;
     description?: string;
+    howToGet?: string;
     rename?: string;
     fields: WriteFieldSpec[];
     removeField?: string;
@@ -154,6 +175,9 @@ function parseSingleBinding(value: string): Binding {
   const field = value.slice(0, separator);
   const env = value.slice(separator + 1);
   if (!isValidFieldName(field)) throw new Error(`无效 binding 字段名：${field}`);
+  if (field === HOW_TO_GET_FIELD) {
+    throw new Error(`${HOW_TO_GET_FIELD} 是条目的获取说明，不是凭证，不能注入环境变量`);
+  }
   if (!ENV_NAME.test(env)) throw new Error(`无效 binding：${value}`);
   if (isReservedEnv(env)) throw new Error(`不能绑定到环境变量：${env}`);
   return { field, env };
@@ -264,11 +288,21 @@ export function parseWriteInvocation(
   operation: WriteOperation,
   cwd: string,
   rest: string[],
+  /**
+   * `ask-owner`: a Create whose every Field is Owner-supplied. A separate verb
+   * because "create" reads as "I am writing a value now", which is the opposite
+   * of what this does — it writes nothing and asks the Owner for the value
+   * (ADR-0007). Fields are bare names here; the caller never spells `@owner`.
+   */
+  askOwner = false,
 ): ParsedInvocation {
-  const usage = operation === "create" ? CREATE_USAGE : operation === "update" ? UPDATE_USAGE : REMOVE_USAGE;
+  const usage = askOwner
+    ? ASK_OWNER_USAGE
+    : operation === "create" ? CREATE_USAGE : operation === "update" ? UPDATE_USAGE : REMOVE_USAGE;
   const { reason, tokens } = extractReason(rest);
   let item: string | undefined;
   let description: string | undefined;
+  let howToGet: string | undefined;
   let rename: string | undefined;
   let removeField: string | undefined;
   const fields: WriteFieldSpec[] = [];
@@ -284,6 +318,10 @@ export function parseWriteInvocation(
         if (description !== undefined) throw new Error("--description 只能给一次");
         description = takeFlagValue(tokens, index++, flag).trim();
         break;
+      case "--how-to-get":
+        if (howToGet !== undefined) throw new Error("--how-to-get 只能给一次");
+        howToGet = takeFlagValue(tokens, index++, flag).trim();
+        break;
       case "--rename":
         if (rename !== undefined) throw new Error("--rename 只能给一次");
         rename = takeFlagValue(tokens, index++, flag).trim();
@@ -294,6 +332,11 @@ export function parseWriteInvocation(
           if (removeField !== undefined) throw new Error("remove 的 --field 只能给一次");
           if (!isValidFieldName(value)) throw new Error(`无效字段名：${value}`);
           removeField = value;
+          break;
+        }
+        if (askOwner) {
+          if (!isValidFieldName(value)) throw new Error(`无效字段名：${value}`);
+          fields.push({ name: value, source: "owner" });
           break;
         }
         fields.push(parseWriteFieldSpec(value));
@@ -313,8 +356,14 @@ export function parseWriteInvocation(
     names.add(field.name);
   }
 
+  if (howToGet !== undefined) {
+    if (!howToGet) throw new Error("--how-to-get 不能是空串：不知道就整个不要给");
+    if (howToGet.length > MAX_HOW_TO_GET) throw new Error(`--how-to-get 最多 ${MAX_HOW_TO_GET} 个字符`);
+  }
   if (operation === "create") {
-    if (fields.length === 0) throw new Error(`create 至少要一个 --field\n${CREATE_USAGE}`);
+    if (fields.length === 0) {
+      throw new Error(askOwner ? `ask-owner 至少要一个 --field\n${ASK_OWNER_USAGE}` : `create 至少要一个 --field\n${CREATE_USAGE}`);
+    }
     if (rename !== undefined) throw new Error("create 不接受 --rename");
   } else if (operation === "update") {
     // @owner is create-only: the lane that skips an Approval may only add.
@@ -325,15 +374,22 @@ export function parseWriteInvocation(
         "或者自己去 vault 客户端里改。",
       );
     }
-    const intents = [rename !== undefined, description !== undefined, fields.length > 0].filter(Boolean).length;
+    const intents = [
+      rename !== undefined,
+      description !== undefined,
+      howToGet !== undefined,
+      fields.length > 0,
+    ].filter(Boolean).length;
     if (intents === 0) throw new Error(UPDATE_USAGE);
-    if (intents > 1) throw new Error("update 一次只能改一类东西：字段值、条目名、描述，请分开提交");
+    if (intents > 1) throw new Error("update 一次只能改一类东西：字段值、条目名、描述、获取方式，请分开提交");
   } else {
     if (fields.length > 0) throw new Error("remove 的 --field 只写字段名，不带 =");
-    if (rename !== undefined || description !== undefined) throw new Error(REMOVE_USAGE);
+    if (rename !== undefined || description !== undefined || howToGet !== undefined) {
+      throw new Error(REMOVE_USAGE);
+    }
   }
 
-  return { action: "write", cwd, operation, item, reason, description, rename, fields, removeField };
+  return { action: "write", cwd, operation, item, reason, description, howToGet, rename, fields, removeField };
 }
 
 const AUTH_ACTIONS_NO_VALUE: AuthAction[] = ["import", "status", "delete"];
@@ -368,6 +424,7 @@ export function parseInvocation(args: string[]): ParsedInvocation {
   if (action === "create" || action === "update" || action === "remove") {
     return parseWriteInvocation(action, cwd, rest);
   }
+  if (action === "ask-owner") return parseWriteInvocation("create", cwd, rest, true);
   if (action === "exec") {
     const separator = rest.indexOf("--");
     if (separator < 0 || separator === rest.length - 1) throw new Error(EXEC_USAGE);
@@ -377,7 +434,7 @@ export function parseInvocation(args: string[]): ParsedInvocation {
     if (command.some((part) => part.length > MAX_ARGV_ENTRY_LENGTH)) throw new Error("命令参数过长");
     return { action, cwd, items: parseItemGroups(tokens), command, reason };
   }
-  throw new Error("用法：secretary list|exec|create|update|remove|auth ...（--version 查看版本）");
+  throw new Error("用法：secretary list|exec|create|ask-owner|update|remove|auth ...（--version 查看版本）");
 }
 
 function parseJson(text: string, context: string): unknown {
@@ -407,6 +464,7 @@ export function parseCatalogResponse(value: unknown): CatalogResponse {
       description: typeof item.description === "string" ? item.description.trim().slice(0, 1000) : "",
       fields: fields.sort(),
       created_at: typeof item.created_at === "string" ? item.created_at.trim().slice(0, 100) : "",
+      how_to_get: typeof item.how_to_get === "string" ? item.how_to_get.trim().slice(0, 500) : "",
     };
   });
   return { items };
@@ -756,11 +814,12 @@ async function validateApprovalResult(
 }
 
 function formatCatalog(catalog: CatalogResponse): string {
-  const headers = ["NAME", "FIELDS", "DESCRIPTION", "CREATED_AT"];
+  const headers = ["NAME", "FIELDS", "DESCRIPTION", "HOW_TO_GET", "CREATED_AT"];
   const rows = catalog.items.map((item) => [
     item.name,
     item.fields.join(","),
     item.description || "-",
+    item.how_to_get || "-",
     item.created_at || "-",
   ]
     .map((value) => value.replace(/[\u0000-\u001f\u007f]/g, " ")));
@@ -906,6 +965,7 @@ async function runWrite(
     user: deps.username().slice(0, 200),
     agent: "code-agent",
     ...(invocation.description !== undefined ? { description: invocation.description } : {}),
+    ...(invocation.howToGet !== undefined ? { how_to_get: invocation.howToGet } : {}),
     ...(invocation.rename !== undefined ? { rename: invocation.rename } : {}),
     ...(invocation.fields.length ? { fields: invocation.fields } : {}),
     ...(values ? { values } : {}),
@@ -927,19 +987,25 @@ async function runWrite(
       method: "POST",
       body,
       timeoutMs: HEADER_TIMEOUT_MS,
-      bodyTimeoutMsFromResponse: (response) => {
-        const advertised = Number(response.headers.get("x-secretary-approval-timeout"));
-        const seconds = Number.isFinite(advertised) && advertised >= 1 && advertised <= 3600
-          ? advertised
-          : DEFAULT_APPROVAL_TIMEOUT_S;
-        return seconds * 1000 + BODY_TIMEOUT_MARGIN_MS;
-      },
+      bodyTimeoutMsFromResponse: () => APPROVAL_WAIT_MS,
       signal: operationAbort.signal,
       // Never resend: the write may already have landed, and a blind retry of a
       // Create would be refused as a name collision anyway (ADR-0005).
       onNetworkError: (error) => {
         if (interrupted) return new Error("已中断等待审批");
         const message = error instanceof Error ? error.message : String(error);
+        // A write has no fast path to re-run into: the vault changes at the
+        // moment of approval, server-side. So the honest answer is "unknown",
+        // and `list` is how the caller finds out.
+        if (error instanceof Error && error.name === "TimeoutError") {
+          return Object.assign(
+            new Error(
+              `Owner 尚未批准这次写入（request_id=${requestId}）。审批卡片已推送，仍然有效。\n` +
+              `vault 目前未改动。等本人批准后，用 secretary list "${invocation.item}" 确认结果——不要重发这条申请。`,
+            ),
+            { exitCode: EXIT_PENDING_APPROVAL },
+          );
+        }
         return new Error(
           `与 secretary 的连接失败或在请求发出后中断（request_id=${requestId}）；不会自动重发。` +
           `请先用 secretary list "${invocation.item}" 确认写入是否已经生效：${message}`,
@@ -1058,17 +1124,12 @@ export async function main(args: string[], deps: ClientDeps = defaultDeps): Prom
       result = await brokerJson(deps, config.token, new URL(`${config.url}/v1/requests`), {
         method: "POST",
         body,
-        // Headers must arrive quickly; the long-polled body deadline is then
-        // derived from the server-advertised approval timeout so the client
-        // always outlives the server-side parking window.
+        // Headers must arrive quickly; the body wait is this client's own
+        // bounded window, NOT the broker's (ADR-0006). Outwaiting the broker
+        // would mean outwaiting the agent harness that spawned us, and a
+        // harness-killed command reports nothing at all.
         timeoutMs: HEADER_TIMEOUT_MS,
-        bodyTimeoutMsFromResponse: (response) => {
-          const advertised = Number(response.headers.get("x-secretary-approval-timeout"));
-          const seconds = Number.isFinite(advertised) && advertised >= 1 && advertised <= 3600
-            ? advertised
-            : DEFAULT_APPROVAL_TIMEOUT_S;
-          return seconds * 1000 + BODY_TIMEOUT_MARGIN_MS;
-        },
+        bodyTimeoutMsFromResponse: () => APPROVAL_WAIT_MS,
         signal: operationAbort.signal,
         // Fail closed, never resend: the request may already have reached the
         // broker (an identical resend would be idempotent server-side via
@@ -1077,11 +1138,22 @@ export async function main(args: string[], deps: ClientDeps = defaultDeps): Prom
           if (interrupted) return new Error("已中断等待审批");
           const message = error instanceof Error ? error.message : String(error);
           if (error instanceof Error && error.name === "TimeoutError") {
-            return new Error(`等待 secretary 审批响应超时（request_id=${requestId}）；不会自动重发，请确认审批状态后重试`);
+            // Not a failure: we stopped waiting, the Request did not stop
+            // existing. Approving mints the Grant, so the re-run is a fast path.
+            return Object.assign(
+              new Error(
+                `Owner 尚未批准这次申请（request_id=${requestId}）。审批卡片已推送，仍然有效。\n` +
+                `未取得任何密钥。等本人批准后重跑同一条命令即可——命中授权会秒过，不要重新提交申请。`,
+              ),
+              { exitCode: EXIT_PENDING_APPROVAL },
+            );
           }
+          // Deliberately not called a timeout: it means the opposite of one.
+          // The Request may well have been approved and the Grant already
+          // minted; re-running is how you find out, and it is cheap.
           return new Error(
-            `与 secretary 的连接失败或在请求发出后中断（request_id=${requestId}）；` +
-            `为安全起见不会自动重发，请确认服务端状态后重试：${message}`,
+            `无法确认本次审批结果（request_id=${requestId}）：与 secretary 的连接中断，可能已经批准。\n` +
+            `直接重跑同一条命令即可——若已获授权会走 fast path 秒过：${message}`,
           );
         },
       });
@@ -1098,9 +1170,11 @@ export async function main(args: string[], deps: ClientDeps = defaultDeps): Prom
     const approved = await validateApprovalResult(
       result, allBindings, deps.now(), clientKeys.privateKey, requestId,
     );
-    if (approved.grant_reused) {
-      deps.stderr(`已复用服务端仍有效的授权（到期：${approved.expires_at}）。\n`);
-    }
+    // Say which path this was: an agent that never sees the difference cannot
+    // learn that "no Telegram card appeared" is a normal, common outcome.
+    deps.stderr(approved.grant_reused
+      ? `本次命中已有授权，未打扰 Owner（到期：${approved.expires_at}）。\n`
+      : `本次经 Owner 审批通过，授权有效期至 ${approved.expires_at}。\n`);
     return await deps.spawn(
       invocation.command,
       canonicalCwd,
@@ -1108,8 +1182,14 @@ export async function main(args: string[], deps: ClientDeps = defaultDeps): Prom
     );
   } catch (error) {
     deps.stderr(error instanceof Error ? error.message : String(error));
-    return 1;
+    return exitCodeFor(error);
   }
+}
+
+/** "Not answered yet" is not a failure and must not look like one. */
+function exitCodeFor(error: unknown): number {
+  const code = (error as { exitCode?: unknown })?.exitCode;
+  return typeof code === "number" ? code : 1;
 }
 
 // ---------------------------------------------------------------------------

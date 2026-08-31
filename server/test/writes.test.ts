@@ -19,8 +19,8 @@ import {
 } from "../src/grants.ts";
 import type { AuthedClient } from "../src/requests.ts";
 import type { BwItem, SecretField, Vault, VaultItemSnapshot } from "../src/vault.ts";
-import { itemFieldValue, snapshotItemsNamed } from "../src/vault.ts";
-import { makeFingerprinter, parseWriteBody, WriteBroker, WriteError } from "../src/writes.ts";
+import { howToGetOf, itemFieldValue, safeFields, snapshotItemsNamed } from "../src/vault.ts";
+import { makeFingerprinter, newLoginItemPayload, parseWriteBody, WriteBroker, WriteError } from "../src/writes.ts";
 
 const CLIENT: AuthedClient = { client_id: "11111111-2222-3333-4444-555555555555", name: "laptop" };
 const ITEM_ID = "aaaaaaaa-bbbb-cccc-dddd-000000000001";
@@ -1167,5 +1167,75 @@ describe("state is always read fresh", () => {
     const { broker, vault } = makeBroker([loginItem()]);
     await broker.handle(body({ operation: "remove", item: "Ghost" }), CLIENT);
     expect(vault.syncs).toBeGreaterThan(0);
+  });
+});
+
+// -- How-to-get (ADR-0007) ---------------------------------------------------
+
+describe("how_to_get", () => {
+  test("is plain text only: markup and script-bearing URLs are refused at the door", () => {
+    const withHowToGet = (how_to_get: string) => parseWriteBody(body({
+      operation: "create",
+      item: "Acme Prod",
+      description: "Acme 生产部署账号，CI 用",
+      how_to_get,
+      fields: [{ name: "password", source: "inline" }],
+      values: { password: "x" },
+    }));
+    expect(withHowToGet("去 https://acme.example/tokens 新建一个 deploy token").how_to_get)
+      .toBe("去 https://acme.example/tokens 新建一个 deploy token");
+    // It is rendered on the page that collects a secret, so it never gets to
+    // carry markup in the first place.
+    expect(() => withHowToGet("<img src=x onerror=alert(1)>")).toThrow("纯文本");
+    expect(() => withHowToGet("点这里 javascript:alert(1)")).toThrow("纯文本");
+    expect(() => withHowToGet("data:text/html;base64,PHNjcmlwdD4=")).toThrow("纯文本");
+    expect(() => withHowToGet("x".repeat(501))).toThrow("最多 500");
+  });
+
+  test("is never a credential field name", () => {
+    expect(() => parseWriteBody(body({
+      operation: "create",
+      item: "Acme Prod",
+      description: "Acme 生产部署账号，CI 用",
+      fields: [{ name: "how_to_get", source: "inline" }],
+      values: { how_to_get: "x" },
+    }))).toThrow("不是凭证字段");
+  });
+
+  test("cannot be removed: a stale acquisition path beats none", () => {
+    expect(() => parseWriteBody(body({
+      operation: "remove",
+      item: "Acme Prod",
+      field: "how_to_get",
+    }))).toThrow("不能删除");
+  });
+
+  test("a new item stores it as a legible text field, not a hidden one", () => {
+    const item = newLoginItemPayload(
+      "Acme Prod",
+      "Acme 生产部署账号",
+      new Map([["password", "s3cret"]]),
+      "去 https://acme.example/tokens 新建",
+    ) as { fields: Array<{ name: string; value: string; type: number }> };
+    const note = item.fields.find((field) => field.name === "how_to_get");
+    // type 0 (text), not 1 (hidden): documentation must be readable in an
+    // ordinary vault client.
+    expect(note).toEqual({ name: "how_to_get", value: "去 https://acme.example/tokens 新建", type: 0 });
+  });
+
+  test("is stripped from the catalog's credential fields but kept as its own attribute", () => {
+    const item: BwItem = {
+      id: "11111111-1111-4111-8111-111111111111",
+      type: 1,
+      name: "Acme Prod",
+      notes: "Acme 生产部署账号",
+      revisionDate: "2026-08-21T08:09:10.000Z",
+      creationDate: "2026-08-21T08:09:10.000Z",
+      login: { username: "ops", password: "s3cret" },
+      fields: [{ name: "how_to_get", value: "去 https://acme.example/tokens 新建", type: 0 }],
+    };
+    expect(safeFields(item)).toEqual(["username", "password"]);
+    expect(howToGetOf(item)).toBe("去 https://acme.example/tokens 新建");
+    expect(howToGetOf({ ...item, fields: [] })).toBe("");
   });
 });

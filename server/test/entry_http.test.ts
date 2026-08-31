@@ -13,6 +13,7 @@ import type {
   WriteNote,
 } from "../src/approver.ts";
 import { ClientRegistry } from "../src/clients.ts";
+import { renderEntryPage } from "../src/entry.ts";
 import { GrantStore } from "../src/grants.ts";
 import { startHttpServer } from "../src/http.ts";
 import { RequestBroker } from "../src/requests.ts";
@@ -244,4 +245,36 @@ test("write preflight errors use HTTP error statuses before the long poll starts
   });
   expect(mismatched.status).toBe(403);
   expect(await mismatched.json()).toEqual({ error: "client_id does not match the authenticated client" });
+});
+
+test("the entry form shows the How-to-get, escaped and with bare URLs linked", () => {
+  const html = renderEntryPage({
+    nonce: "n",
+    expires_at: Date.now() + 60_000,
+    item: "Acme Prod",
+    description: "Acme 生产部署账号",
+    how_to_get: "去 https://acme.example/tokens\n新建一个 deploy token",
+    owner_fields: ["password"],
+    inline_fields: [],
+    payload: null,
+  });
+  expect(html).toContain('<a href="https://acme.example/tokens" rel="noopener noreferrer nofollow"');
+  expect(html).toContain("<br>新建一个 deploy token");
+});
+
+test("agent prose can never inject markup into the page that collects the secret", () => {
+  const html = renderEntryPage({
+    nonce: "n",
+    expires_at: Date.now() + 60_000,
+    item: "Acme Prod",
+    description: "Acme 生产部署账号",
+    // Refused at write time; this is the second wall, and it must hold alone.
+    how_to_get: "<img src=x onerror=alert(1)> <script>steal()</script>",
+    owner_fields: ["password"],
+    inline_fields: [],
+    payload: null,
+  });
+  expect(html).not.toContain("<img");
+  expect(html).not.toContain("<script>steal");
+  expect(html).toContain("&lt;img");
 });

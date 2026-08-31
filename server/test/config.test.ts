@@ -55,9 +55,10 @@ describe("loadConfig", () => {
     const config = loadConfig(BASE_ENV);
     expect(config.vault_url).toBe("https://vault.example.com");
     expect(config.telegram_allowed_user_ids).toEqual([42, 43]);
-    expect(config.approval_timeout_s).toBe(300);
+    expect(config.approval_timeout_s).toBe(1500);
     expect(config.sync_max_age_s).toBe(60);
-    expect(config.entry_ttl_s).toBe(600);
+    expect(config.approval_cards).toBe(5);
+    expect(config.entry_ttl_s).toBe(1800);
     expect(config.db_path).toBe("/data/secretary.sqlite");
     expect(config.listen_addr).toEqual({ hostname: "0.0.0.0", port: 8787 });
     expect(config.dev_auto_approve).toBe(false);
@@ -94,7 +95,13 @@ describe("loadConfig", () => {
   test("approval timeout bounds", () => {
     expect(loadConfig({ ...BASE_ENV, APPROVAL_TIMEOUT_S: "60" }).approval_timeout_s).toBe(60);
     expect(() => loadConfig({ ...BASE_ENV, APPROVAL_TIMEOUT_S: "0" })).toThrow("APPROVAL_TIMEOUT_S");
-    expect(() => loadConfig({ ...BASE_ENV, APPROVAL_TIMEOUT_S: "601" })).toThrow("APPROVAL_TIMEOUT_S");
+    expect(() => loadConfig({ ...BASE_ENV, APPROVAL_TIMEOUT_S: "3601" })).toThrow("APPROVAL_TIMEOUT_S");
+  });
+
+  test("approval card count bounds", () => {
+    expect(loadConfig({ ...BASE_ENV, APPROVAL_CARDS: "1" }).approval_cards).toBe(1);
+    expect(() => loadConfig({ ...BASE_ENV, APPROVAL_CARDS: "0" })).toThrow("APPROVAL_CARDS");
+    expect(() => loadConfig({ ...BASE_ENV, APPROVAL_CARDS: "21" })).toThrow("APPROVAL_CARDS");
   });
 });
 

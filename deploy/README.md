@@ -162,7 +162,8 @@ command runs with `MY_TOKEN` set in its environment only.
   tailnet, a VPN, or TLS terminated by the broker's own ingress — and do not
   front it with a terminating tunnel you would not trust with the values.
 - **The Entry Form link is the capability** for the one write it completes. It
-  is single-use and expires after `ENTRY_TTL_S` (default 600 s). Because
+  is single-use and expires after `ENTRY_TTL_S` (default 1800 s — long enough to
+  follow an Item's How-to-get to a console and generate the value). Because
   holding it is enough, Owner-supplied values are accepted only by `create`,
   which can add but never overwrite or destroy.
 - **Destructive writes revoke authorization before and after mutation.** Removing

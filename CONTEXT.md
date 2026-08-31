@@ -37,8 +37,20 @@ reason. A Request either hits Grants (fast path) or becomes an Approval.
 
 An Owner decision on a Request, delivered through an Approver channel. Approving
 carries a TTL choice (1h / 8h / 7d) and creates Grants; rejecting fails the
-Request. No decision within the timeout fails closed. On a Write Request there
+Request. No decision within the window fails closed — but the window belongs to
+the Broker, not to whoever is waiting: the Client stops waiting long before it
+closes (ADR-0006). On a Write Request there
 is no TTL to choose — approving it changes the vault once and grants nothing.
+
+## Approval card
+
+One rendering of a pending Approval in the Approver's channel. A Request has one
+Approval but may have several cards over its life: the Broker replaces the
+standing card on a timer until the window runs out, because editing a message in
+place produces no notification and an edited card is one the Owner never learns
+about. Any card's buttons resolve the Request it belongs to; the last one is left
+in the chat marked abandoned rather than deleted, so a chat the Owner returns to
+is never silent about what was missed (ADR-0006).
 
 ## Approver
 
@@ -132,6 +144,16 @@ An Item's stated purpose, carried in the vault's own notes field. It is the only
 thing about an Item a Client may read without an Approval, so it is what an
 agent uses to tell one Item from another — and therefore required when creating
 one.
+
+## How-to-get
+
+Where a credential comes from and what steps produce a fresh one: an Item-level
+plain-text note, stored as a reserved custom field. Best effort and never
+required — filled in when the writer knows, left out when they do not, and never
+invented, because a plausible-sounding invention reads as knowledge and nobody
+will think to replace it. Enforcement is the Owner's eye on the Approval card,
+not a validator (ADR-0007). It is documentation, not a credential: excluded from
+the Item's Fields and refused as a binding.
 
 ## Fingerprint
 

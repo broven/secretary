@@ -60,7 +60,14 @@ stays the source of truth), Windows support for the CLI (macOS/Linux first).
    notification with a revoke button.
 4. **Approval path**: broker sends the Telegram card (approve 1h/8h/7d, reject),
    parks the request in memory, and resolves it when the button callback arrives
-   via getUpdates. First decision wins; timeout (default 300 s) fails closed.
+   via getUpdates. First decision wins; the window (`APPROVAL_TIMEOUT_S`,
+   default 1500 s) fails closed. The window is split into `APPROVAL_CARDS`
+   (default 5) cards: each replaces the one before it by delete-then-send, since
+   an edited message produces no push notification. The CLI does **not** wait
+   that long — it gives up after ~100 s and tells its caller to re-run, because
+   an agent harness would kill a longer command and report nothing at all
+   (ADR-0006). The Request stays parked either way, and approval mints the Grant
+   that makes the re-run a fast path.
 5. CLI decrypts the Envelope and execs the child with secrets in its environment.
    Nothing is persisted server-side but Grants, Sightings, and destructive-write
    revocation watermarks — never job results, write outcomes, or plaintext.
@@ -90,7 +97,16 @@ Item, so an approval card is never ambiguous about what it is asking for.
    reads that were already awaiting Approval, or that resolved while the mutation
    was in flight, from issuing a late Grant.
 
-**Owner-supplied values** (`--field password=@owner`) never enter the agent's context.
+`--how-to-get` records where a credential comes from (ADR-0007): an Item-level
+plain-text custom field (`how_to_get`, type 0), never required, refused if it carries
+markup or a `javascript:`/`data:` URL, rendered in full on the approval card as plain
+text — never MarkdownV2, whose escaping failures would make the card undeliverable — and
+on the Entry Form with escaping, newline preservation and bare-URL autolinking only. It
+is stripped from the catalog's field list and refused as an `exec` binding: it is
+documentation, not a credential.
+
+**Owner-supplied values** (`--field password=@owner`, or the `ask-owner` verb, which is
+a Create whose every Field is Owner-supplied) never enter the agent's context.
 The broker parks the request and returns a one-time Entry Form link; the CLI prints it
 and exits without writing. The Owner opens it, types the value, and the write lands,
 followed by a non-blocking notification through the Approver. The link is bound to no
@@ -108,6 +124,7 @@ approved — three orchestrated jobs, 1.25 s client polling, and up to three ful
 | --- | --- |
 | Fast path, end-to-end (CLI invoke → child starts), incl. public RTT | p50 < 1 s, p95 < 2 s |
 | Approval path, from Owner's button tap → secrets delivered | < 2 s |
+| Approval path after the CLI gave up: Owner taps → agent re-runs → child starts | one fast path (p50 < 1 s) |
 
 What buys it: a single HTTP round trip instead of job orchestration; a resident
 unlocked `bw` session with on-demand sync instead of login+sync per step; `bw`
@@ -152,8 +169,9 @@ One port serves everything, including the Entry Form at `/entry/<nonce>`. That f
 accepts a plaintext value over the transport alone (ADR-0004), so the broker must be
 reached over a path trusted end to end — a tailnet, a VPN, or TLS terminated by the
 broker's own ingress — and **not** through a TLS-terminating tunnel or reverse proxy
-you would not trust with the value itself. `ENTRY_TTL_S` (default 600) bounds how long
-a link stays usable.
+you would not trust with the value itself. `ENTRY_TTL_S` (default 1800) bounds how long
+a link stays usable — long enough for the Owner to follow an Item's How-to-get to a
+console, generate the credential, and come back.
 
 ## Migration from the Windmill pipeline
 

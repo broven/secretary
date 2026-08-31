@@ -30,7 +30,8 @@ to the secretary broker, which is the only thing that ever holds plaintext. You 
 
 - **read** the safe catalog (`list`) and run one command with secrets injected (`exec`);
 - **write** to the vault (`create` / `update` / `remove`), each write approved by the
-  Owner from Telegram.
+  Owner from Telegram;
+- **ask** the Owner for a credential you must not see (`ask-owner`).
 
 You never see a credential value. Reads inject into a child process's environment;
 writes take values from stdin or from the Owner directly.
@@ -69,9 +70,26 @@ approved-secret exec --reason "nightly sync between GitHub and OpenAI usage data
 ```
 
 Every env name must be unique across all `--item` groups; each field may be bound once;
-up to 10 items per approval. `exec` blocks until it has an answer. A previously approved
-request may be reused silently with no Telegram prompt at all — so only tell the user to
-go approve something once the command has actually been waiting a while.
+up to 10 items per approval. A previously approved request may be reused silently with no
+Telegram prompt at all; `exec` says which happened when it succeeds, so read that line
+before telling the user anything about approvals.
+
+### When exec comes back "尚未批准"
+
+`exec` waits about 100 seconds and then gives up **on the wait, not on the request**
+(exit code 75). The approval card is still live in the Owner's chat, and the broker will
+keep re-sending it for roughly 25 minutes. Nothing was granted and nothing ran.
+
+Do this, in order:
+
+1. Tell the user, in one line, that a card is waiting for them — name the item.
+2. Re-run **the same command** after about 60 seconds. Approval mints the authorization,
+   so a re-run after approval is an ordinary fast path and returns in under a second.
+3. At most three re-runs. Then stop, say the card is still unanswered, and wait for the
+   user.
+
+Never submit a *second* request instead of re-running: re-sending the card is the
+broker's job, and a duplicate request just puts two cards in front of the Owner.
 
 Report the command result or the approval failure. **Never report a credential value.**
 
@@ -107,6 +125,25 @@ Values never appear in argv. A field's value comes from exactly one of:
 - `@owner` — the value must not enter your context; the Owner types it into a one-time
   web form. **Only `create` may use `@owner`.**
 
+### ask-owner — you need a credential you must not see
+
+Use this the moment you need a credential you do not have. It writes **nothing** and
+reveals nothing: it prints a one-time link and exits. Running it is always safe, so
+**do not ask permission first, and do not hand the command to the user to run.**
+
+```bash
+approved-secret ask-owner --item "Linear API" \
+  --description "Linear Personal API Key，直接调 GraphQL API 用" \
+  --how-to-get "Linear → Settings → Security & access → Personal API keys → New key" \
+  --field api_key \
+  --reason "要直接调 Linear GraphQL API，vault 里没有可用的 key"
+```
+
+Fields are bare names — no `=@owner`. **Pick the item name and description yourself**;
+they are yours to decide, and a name you regret costs one `update --rename` later. Ask
+the user only when you genuinely cannot tell what the credential is *for* — not to have
+a name approved.
+
 ### create — a new item, or a new field on an existing item
 
 ```bash
@@ -130,6 +167,14 @@ USERNAME_VALUE="ops@acme.com" jq -n '{username: env.USERNAME_VALUE}' | \
     --field username=@stdin --field password=@owner \
     --reason "注册完账号，密码由本人设置"
 ```
+
+**`--how-to-get` records where the credential comes from.** Optional, and never
+fabricated: write it when you know (you usually do — you are the one proposing this
+credential, and you generally named the console page it comes from), leave the flag off
+entirely when you do not. "Get it from the official site" is worse than nothing, because
+it reads as knowledge. It is shown to the Owner on the approval card and on the entry
+form, and to future agents in `list`. It is documentation, not a credential: it can
+never be a `--field` name and can never be bound to an environment variable.
 
 **`--description` is the intent switch.** With it you are creating a new item, and a
 name that is already taken is an **error**. Without it you are adding fields to an item
@@ -161,7 +206,8 @@ approved-secret update --item "Acme Prod" --description "Acme 生产部署账号
 ```
 
 One `update` changes **one kind of thing** — field values, or the name, or the
-description. Not two at once.
+description, or the how-to-get. Not two at once. Updating the how-to-get is worth doing
+whenever you notice the acquisition path has changed (a console redesign, a moved menu).
 
 If the vault already holds the value you are asking for, the command succeeds as
 "unchanged" and the Owner is not disturbed. That is what makes a retry safe.
@@ -176,6 +222,8 @@ approved-secret remove --item "Acme Prod" --reason "服务已下线，条目不�
 approved-secret remove --item "Acme Prod" --field api_key --reason "这个 key 已作废撤销"
 ```
 
+- `how_to_get` cannot be removed. Correct it with `update --how-to-get` instead — a
+  stale acquisition path is still better than none.
 - Removing an **item** puts it in the vault's trash — recoverable.
 - Removing a **field** is **irreversible**: the vault keeps no history for fields.
 - Either way, existing authorizations for what was removed are revoked. Restoring an
@@ -211,14 +259,16 @@ they have filled it in. Confirm with `approved-secret list "<item>"` before cont
 - Do not background the broker or poll its internal APIs. One foreground command owns
   start, waiting, timeout, and cancellation.
 - Use `--json` only to parse catalog metadata; catalog output never contains values.
-- If approval is denied or times out, **fail closed**. Do not resend. Retry only when
-  the user asks or is ready to approve.
+- **Denied** means stop for good: fail closed, never resend, report which item was
+  refused, and find another way. **尚未批准** (exit 75) is not a denial — follow the
+  re-run procedure above. If a command reports it cannot confirm the result, re-running
+  is the correct move, not a risk: it may already be approved.
 - **Never weaken, pad, or genericise `--reason`.** If you cannot state a specific
   purpose, you should not be asking.
 - After a network failure on a write, **do not blindly retry**. Run
   `approved-secret list "<item>"` first: the write may already have landed.
-- If a credential you need is absent, say what catalog entry is needed. Creating it is a
-  deliberate `create`, with a real description — not a guess.
+- If a credential you need is absent, do not stop and describe what is missing — run
+  `ask-owner` and give the user the link. Naming the item is your call, not theirs.
 
 Token setup is a human-only bootstrap action. If the command reports that no token is
 configured, ask the user to run `approved-secret auth import`; never request or accept

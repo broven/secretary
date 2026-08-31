@@ -199,6 +199,7 @@ const WRITE_CARD_TITLES: Readonly<Record<WriteCardKind, string>> = {
   update_value: "改字段值",
   update_rename: "改条目名",
   update_description: "改条目描述",
+  update_how_to_get: "改获取方式",
   remove_item: "删除条目",
   remove_field: "删除字段",
 };
@@ -384,6 +385,11 @@ type PendingApproval = {
   resolve: (decision: ApprovalDecision) => void;
   timer: ReturnType<typeof setTimeout>;
   inlineShell: boolean;
+  /** Message ids of the card currently in the chat, so it can be replaced. */
+  messageIds: number[];
+  /** Set by the total-window timer before it resolves, so the re-push loop can
+   * tell "the Owner never answered" from "the Owner decided". */
+  timedOut: boolean;
 };
 
 type PendingWrite = {
@@ -397,6 +403,12 @@ export type TelegramApproverConfig = {
   chatId: string;
   allowedUserIds: number[];
   apiBase?: string;
+  /**
+   * How many cards one approval window is split into (ADR-0006). Each replaces
+   * the one before it, because editing a message produces no push notification
+   * and an edited card is one the Owner never learns about.
+   */
+  approvalCards?: number;
 };
 
 export type TelegramApproverHooks = {
@@ -420,6 +432,7 @@ export class TelegramApprover implements Approver {
   private readonly chatId: string;
   private readonly allowedUserIds: number[];
   private readonly apiBase: string;
+  private readonly approvalCards: number;
   private readonly hooks: TelegramApproverHooks;
   private readonly fetchImpl: typeof fetch;
   private readonly log: (msg: string) => void;
@@ -445,6 +458,7 @@ export class TelegramApprover implements Approver {
     this.chatId = config.chatId;
     this.allowedUserIds = [...config.allowedUserIds];
     this.apiBase = (config.apiBase ?? "https://api.telegram.org").replace(/\/+$/, "");
+    this.approvalCards = Math.max(1, Math.floor(config.approvalCards ?? 1));
     this.hooks = hooks;
     this.fetchImpl = deps.fetchImpl ?? fetch;
     this.log = deps.log ?? ((msg) => console.log(msg));
@@ -466,6 +480,7 @@ export class TelegramApprover implements Approver {
     // never hang and timers never keep the process alive.
     for (const [id, entry] of this.pending) {
       clearTimeout(entry.timer);
+      entry.timedOut = true;
       entry.resolve({ approved: false, reason: "timeout" });
       this.pending.delete(id);
     }
@@ -484,27 +499,16 @@ export class TelegramApprover implements Approver {
     let entry: PendingApproval;
     const decision = new Promise<ApprovalDecision>((resolve) => {
       const timer = setTimeout(() => {
+        const parked = this.pending.get(card.id);
+        if (parked) parked.timedOut = true;
         this.pending.delete(card.id);
         resolve({ approved: false, reason: "timeout" });
       }, timeoutMs);
-      entry = { resolve, timer, inlineShell: card.inline_shell };
+      entry = { resolve, timer, inlineShell: card.inline_shell, messageIds: [], timedOut: false };
       this.pending.set(card.id, entry);
     });
     try {
-      // The card renders completely (every item, every mapping, the command)
-      // across one or more messages, or buildApprovalMessages throws and the
-      // request is rejected. The keyboard rides on the LAST message so the
-      // Owner has scrolled past everything the buttons would grant.
-      const texts = buildApprovalMessages(card);
-      for (let index = 0; index < texts.length; index++) {
-        await this.api("sendMessage", {
-          chat_id: this.chatId,
-          text: texts[index],
-          parse_mode: "HTML",
-          disable_web_page_preview: true,
-          ...(index === texts.length - 1 ? { reply_markup: buildApprovalKeyboard(card) } : {}),
-        }, AbortSignal.timeout(Math.min(timeoutMs, 30_000)));
-      }
+      entry!.messageIds = await this.sendApprovalCard(card, timeoutMs, 1);
     } catch (error) {
       // Rendering and sendMessage failures propagate: the caller treats an
       // undeliverable/incomplete card as a failed request (fail closed), not a
@@ -515,7 +519,102 @@ export class TelegramApprover implements Approver {
         throw error;
       }
     }
+    // Later cards are best effort and must not delay the caller: the window is
+    // already armed, and a failed re-push leaves the previous card standing.
+    void this.repushApprovalCard(card, entry!, timeoutMs);
     return decision;
+  }
+
+  /**
+   * Render and deliver one card. The card renders completely (every item, every
+   * mapping, the command) across one or more messages, or buildApprovalMessages
+   * throws and the request is rejected. The keyboard rides on the LAST message
+   * so the Owner has scrolled past everything the buttons would grant.
+   */
+  private async sendApprovalCard(
+    card: ApprovalCard,
+    timeoutMs: number,
+    round: number,
+  ): Promise<number[]> {
+    const texts = buildApprovalMessages(card);
+    const sent: number[] = [];
+    for (let index = 0; index < texts.length; index++) {
+      const first = index === 0;
+      const last = index === texts.length - 1;
+      const message = await this.api<{ message_id?: unknown }>("sendMessage", {
+        chat_id: this.chatId,
+        text: first && round > 1 ? `${REPUSH_PREFIX(round)}\n${texts[index]}` : texts[index],
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+        ...(last ? { reply_markup: buildApprovalKeyboard(card) } : {}),
+      }, AbortSignal.timeout(Math.min(timeoutMs, 30_000)));
+      if (typeof message?.message_id === "number") sent.push(message.message_id);
+    }
+    return sent;
+  }
+
+  /**
+   * Keep exactly one live card in the chat for the life of the window
+   * (ADR-0006). Replacing means delete-then-send: `editMessageText` produces no
+   * push notification, so an edited card is one the Owner never learns about.
+   * The final card is not deleted — it is turned into a record that something
+   * was asked and missed, so a chat the Owner comes back to is not silent.
+   */
+  private async repushApprovalCard(
+    card: ApprovalCard,
+    entry: PendingApproval,
+    timeoutMs: number,
+  ): Promise<void> {
+    const rounds = this.approvalCards;
+    const roundMs = Math.max(1, Math.floor(timeoutMs / rounds));
+    const stillParked = () => this.pending.get(card.id) === entry;
+    for (let round = 2; round <= rounds; round++) {
+      await delay(roundMs);
+      if (!stillParked()) break;
+      try {
+        const next = await this.sendApprovalCard(card, timeoutMs, round);
+        const previous = entry.messageIds;
+        entry.messageIds = next;
+        await this.deleteMessages(previous);
+      } catch (error) {
+        // Leave the standing card alone: a chat with a stale-looking card beats
+        // a chat with none. The window is unaffected either way.
+        this.log(`telegram approval re-push failed (card ${round}/${rounds}): ${errorMessage(error)}`);
+      }
+    }
+    // Wait out the tail of the window, then mark the last card abandoned.
+    while (stillParked()) await delay(Math.min(roundMs, 5_000));
+    if (!entry.timedOut) return;
+    const last = entry.messageIds[entry.messageIds.length - 1];
+    if (last === undefined) return;
+    try {
+      await this.api("editMessageReplyMarkup", {
+        chat_id: this.chatId,
+        message_id: last,
+        reply_markup: { inline_keyboard: [] },
+      });
+      await this.api("sendMessage", {
+        chat_id: this.chatId,
+        text: GAVE_UP_TEXT,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+        reply_to_message_id: last,
+        allow_sending_without_reply: true,
+      });
+    } catch (error) {
+      this.log(`telegram approval give-up notice failed: ${errorMessage(error)}`);
+    }
+  }
+
+  /** Best effort: a card that cannot be deleted is noise, not a failure. */
+  private async deleteMessages(messageIds: number[]): Promise<void> {
+    for (const messageId of messageIds) {
+      try {
+        await this.api("deleteMessage", { chat_id: this.chatId, message_id: messageId });
+      } catch (error) {
+        this.log(`telegram deleteMessage failed: ${errorMessage(error)}`);
+      }
+    }
   }
 
   async requestWriteApproval(card: WriteCard, timeoutMs: number): Promise<WriteDecision> {
@@ -804,6 +903,15 @@ function decisionForAction(
     if (isSecretGrantTtl(ttl)) return approve(ttl);
   }
   return null;
+}
+
+/** Marks a card as a re-push so the Owner can see it is the same ask, not a new one. */
+const REPUSH_PREFIX = (round: number): string => `\u{1F501} <b>\u91cd\u65b0\u63d0\u9192\uff08\u7b2c ${round} \u6b21\uff09</b>`;
+
+const GAVE_UP_TEXT = "\u23f0 <b>\u5df2\u653e\u5f03\uff08\u8d85\u65f6\u672a\u54cd\u5e94\uff09</b>\n\u4e0a\u9762\u8fd9\u5f20\u5361\u7247\u5df2\u5931\u6548\uff0c\u672a\u6388\u4e88\u4efb\u4f55\u6743\u9650\u3002\u9700\u8981\u7684\u8bdd\u8ba9\u8c03\u7528\u65b9\u91cd\u8dd1\u4e00\u6b21\u3002";
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function errorMessage(error: unknown): string {
