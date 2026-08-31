@@ -462,3 +462,19 @@ test("a decision on the standing card stops the re-push", async () => {
     repusher.stop();
   }
 });
+
+test("a how-to-get change is titled as one, not as a description change", () => {
+  // The card kind drives the title. Reusing update_description here would ask
+  // the Owner to approve a card headed "改条目描述" whose diff is about
+  // something else — exactly what the render-completely contract forbids.
+  const text = buildWriteMessages(makeWriteCard({
+    kind: "update_how_to_get",
+    lines: [
+      { label: "现获取方式", value: "（未记录）", plain: true },
+      { label: "新获取方式", value: "Settings → Developer → Tokens", plain: true },
+    ],
+  })).join("\n");
+  expect(text).toContain("改获取方式");
+  expect(text).not.toContain("改条目描述");
+  expect(text).toContain("Settings → Developer → Tokens");
+});

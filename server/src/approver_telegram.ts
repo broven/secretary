@@ -199,6 +199,7 @@ const WRITE_CARD_TITLES: Readonly<Record<WriteCardKind, string>> = {
   update_value: "改字段值",
   update_rename: "改条目名",
   update_description: "改条目描述",
+  update_how_to_get: "改获取方式",
   remove_item: "删除条目",
   remove_field: "删除字段",
 };

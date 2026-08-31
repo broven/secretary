@@ -741,7 +741,7 @@ export class WriteBroker {
     }
     // Not a credential: the Owner sees the real diff, which is also the only
     // thing standing between the vault and a plausible-sounding invention.
-    const card = this.card(parsed, client, "update_description", [
+    const card = this.card(parsed, client, "update_how_to_get", [
       { label: "现获取方式", value: current || "（未记录）", plain: true },
       { label: "新获取方式", value: target, plain: true },
     ], []);

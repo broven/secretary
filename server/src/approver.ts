@@ -78,6 +78,7 @@ export type WriteCardKind =
   | "update_value"
   | "update_rename"
   | "update_description"
+  | "update_how_to_get"
   | "remove_item"
   | "remove_field";
 
