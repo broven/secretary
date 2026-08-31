@@ -137,6 +137,12 @@ function longPollResponse(
           // Already errored/cancelled.
         }
       };
+      // Flush one byte immediately. A client's `fetch` does not resolve its
+      // Response until the first body byte arrives, so without this the caller
+      // sits for a whole heartbeat before its own wait even starts — and that
+      // silent prologue lands squarely on top of an agent harness's command
+      // timeout, which is the failure ADR-0006 exists to remove.
+      safeEnqueue("\n");
       timer = setInterval(() => safeEnqueue("\n"), HEARTBEAT_INTERVAL_MS);
       // NOTE on disconnects: the parked approval is deliberately NOT cancelled
       // when the client goes away — the Owner may already be reading the card,
