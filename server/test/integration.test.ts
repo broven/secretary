@@ -586,3 +586,33 @@ describe("broker integration (fake telegram + fake vault)", () => {
     expect(credentials).toEqual({ DEV_TOKEN: "dev-secret" });
   }, 15_000);
 });
+
+  test("a parked long poll answers with a byte immediately, not after a heartbeat", async () => {
+    const stack = await startStack();
+    const keys = await clientKeys();
+    const abort = new AbortController();
+
+    // A client's fetch does not resolve until the first body byte arrives, so
+    // a server that waits a full heartbeat before speaking silently prepends
+    // that delay to the caller's own wait. Measured live, that prologue pushed
+    // a 100 s wait to 121 s against a 120 s harness timeout (ADR-0006).
+    const started = Date.now();
+    const response = await fetch(`${stack.url}/v1/requests`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${stack.token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(requestBody({}, keys.publicKeyJwk)),
+      signal: abort.signal,
+    });
+    const reader = response.body!.getReader();
+    await reader.read();
+    const elapsed = Date.now() - started;
+
+    // The heartbeat interval is 20 s; anything in that neighbourhood means the
+    // first byte is riding on it again.
+    expect(elapsed).toBeLessThan(2000);
+    expect(response.status).toBe(200);
+
+    await reader.cancel().catch(() => undefined);
+    abort.abort();
+    await Bun.sleep(50);
+  });
