@@ -2,7 +2,6 @@
 name: use-approved-secrets
 description: Discover, use, and record Bitwarden-backed credentials through the local secretary broker and its Telegram approval channel. Use whenever a Code Agent needs to search or list available API keys, tokens, passwords, usernames, credentials, or secret environment variables; must run a command with an approved secret without revealing its value; or has just obtained a credential that should be stored in the vault instead of a file.
 ---
-
 # Use Approved Secrets
 
 ## Prerequisite
@@ -24,13 +23,12 @@ Then the user points it at their broker: `auth set-url <their broker URL>` and
 `auth import` (the token comes from `client add` on the broker host). Those two
 steps are theirs — never ask for, accept, or echo the token.
 
-
 Credentials live in a Bitwarden/Vaultwarden vault. The `approved-secret` command talks
 to the secretary broker, which is the only thing that ever holds plaintext. You can:
 
 - **read** the safe catalog (`list`) and run one command with secrets injected (`exec`);
 - **write** to the vault (`create` / `update` / `remove`), each write approved by the
-  Owner from Telegram;
+Owner from Telegram;
 - **ask** the Owner for a credential you must not see (`ask-owner`).
 
 You never see a credential value. Reads inject into a child process's environment;
@@ -45,7 +43,7 @@ approved-secret list github
 approved-secret list github --json
 ```
 
-Each item shows `name`, `fields`, `description` and `created_at`. **`description` is
+Each item shows `name`, `fields`, `description` and `created_at`. `**description` is
 the item's stated purpose** (it is the vault's notes field) — use it to decide whether
 an item is the one you want. `created_at` tells you whether an item is one you just
 made or one that predates you.
@@ -84,9 +82,9 @@ Do this, in order:
 
 1. Tell the user, in one line, that a card is waiting for them — name the item.
 2. Re-run **the same command** after about 60 seconds. Approval mints the authorization,
-   so a re-run after approval is an ordinary fast path and returns in under a second.
+ so a re-run after approval is an ordinary fast path and returns in under a second.
 3. At most three re-runs. Then stop, say the card is still unanswered, and wait for the
-   user.
+ user.
 
 Never submit a *second* request instead of re-running: re-sending the card is the
 broker's job, and a duplicate request just puts two cards in front of the Owner.
@@ -103,8 +101,8 @@ The Owner picks 1 hour, 8 hours, or 7 days. The authorization is stored per
 - **Rotating the value does not revoke it** — the item's identity is its id.
 - Adding an item or field that was never approved does re-trigger approval.
 - The command is **not** part of the authorization. The first time a given command runs
-  against a given set of items, the Owner gets a non-blocking notification carrying the
-  full argv and a revoke button. Execution is not delayed by it.
+against a given set of items, the Owner gets a non-blocking notification carrying the
+full argv and a revoke button. Execution is not delayed by it.
 
 ### Inline shell
 
@@ -123,7 +121,7 @@ Values never appear in argv. A field's value comes from exactly one of:
 
 - `@stdin` — you already have the value; pass it as a JSON object on standard input.
 - `@owner` — the value must not enter your context; the Owner types it into a one-time
-  web form. **Only `create` may use `@owner`.**
+web form. **Only `create` may use `@owner`.**
 
 ### ask-owner — you need a credential you must not see
 
@@ -168,15 +166,11 @@ USERNAME_VALUE="ops@acme.com" jq -n '{username: env.USERNAME_VALUE}' | \
     --reason "注册完账号，密码由本人设置"
 ```
 
-**`--how-to-get` records where the credential comes from.** Optional, and never
-fabricated: write it when you know (you usually do — you are the one proposing this
-credential, and you generally named the console page it comes from), leave the flag off
-entirely when you do not. "Get it from the official site" is worse than nothing, because
-it reads as knowledge. It is shown to the Owner on the approval card and on the entry
-form, and to future agents in `list`. It is documentation, not a credential: it can
-never be a `--field` name and can never be bound to an environment variable.
+`--how-to-get 用户引导和告知用户如何获得 or 创建对应凭据，有对应站点的 url 就告知用户。知道来源时就填写，不知道`
 
-**`--description` is the intent switch.** With it you are creating a new item, and a
+`时则完全不要使用这个参数。`
+
+`**--description` is the intent switch.** With it you are creating a new item, and a
 name that is already taken is an **error**. Without it you are adding fields to an item
 that must already exist.
 
@@ -184,9 +178,9 @@ that must already exist.
 and read its `description` and `created_at`:
 
 - created seconds ago with your description → your previous attempt already succeeded;
-  carry on.
+carry on.
 - something else entirely → pick a different item name, or add your fields to it
-  deliberately (drop `--description`).
+deliberately (drop `--description`).
 
 Same for "already has field X": that means the field is there — use `update` to change
 its value, or accept that a retry already landed.
@@ -223,11 +217,11 @@ approved-secret remove --item "Acme Prod" --field api_key --reason "这个 key �
 ```
 
 - `how_to_get` cannot be removed. Correct it with `update --how-to-get` instead — a
-  stale acquisition path is still better than none.
+stale acquisition path is still better than none.
 - Removing an **item** puts it in the vault's trash — recoverable.
 - Removing a **field** is **irreversible**: the vault keeps no history for fields.
 - Either way, existing authorizations for what was removed are revoked. Restoring an
-  item from the trash does **not** bring them back.
+item from the trash does **not** bring them back.
 
 ### The Owner-entry link
 
@@ -249,26 +243,26 @@ they have filled it in. Confirm with `approved-secret list "<item>"` before cont
 ## Safety Rules
 
 - **Never put a secret value in argv**, a URL, a file, logs, chat, or source code. The
-  CLI refuses `--field NAME=<value>` for exactly this reason.
+CLI refuses `--field NAME=<value>` for exactly this reason.
 - Never print or inspect secret-bearing environment variables with `env`, `printenv`,
-  `echo`, debug dumps, or `set -x`.
+`echo`, debug dumps, or `set -x`.
 - Never call `bw`, `rbw`, `fnox`, or Bitwarden APIs directly for an interactive secret
-  request.
+request.
 - Do not bind secrets to control names such as `PATH`, `HOME`, `SECRETARY_*`, `BW_*`,
-  or `MISE_*`; the runner rejects them.
+or `MISE_*`; the runner rejects them.
 - Do not background the broker or poll its internal APIs. One foreground command owns
-  start, waiting, timeout, and cancellation.
+start, waiting, timeout, and cancellation.
 - Use `--json` only to parse catalog metadata; catalog output never contains values.
 - **Denied** means stop for good: fail closed, never resend, report which item was
-  refused, and find another way. **尚未批准** (exit 75) is not a denial — follow the
-  re-run procedure above. If a command reports it cannot confirm the result, re-running
-  is the correct move, not a risk: it may already be approved.
+refused, and find another way. **尚未批准** (exit 75) is not a denial — follow the
+re-run procedure above. If a command reports it cannot confirm the result, re-running
+is the correct move, not a risk: it may already be approved.
 - **Never weaken, pad, or genericise `--reason`.** If you cannot state a specific
-  purpose, you should not be asking.
+purpose, you should not be asking.
 - After a network failure on a write, **do not blindly retry**. Run
-  `approved-secret list "<item>"` first: the write may already have landed.
+`approved-secret list "<item>"` first: the write may already have landed.
 - If a credential you need is absent, do not stop and describe what is missing — run
-  `ask-owner` and give the user the link. Naming the item is your call, not theirs.
+`ask-owner` and give the user the link. Naming the item is your call, not theirs.
 
 Token setup is a human-only bootstrap action. If the command reports that no token is
 configured, ask the user to run `approved-secret auth import`; never request or accept
