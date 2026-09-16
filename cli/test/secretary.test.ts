@@ -386,6 +386,16 @@ describe("self-contained secretary client", () => {
     expect(JSON.stringify(context.requests)).not.toContain("approved-EXAMPLE_TOKEN");
   });
 
+  test("accepts a 30-day approval lease", async () => {
+    const context = makeDeps({
+      resultExtras: { ttl: "30d", expires_at: "2030-01-31T00:00:00.000Z" },
+    });
+    expect(await main([
+      "--cwd", "/linked/repo", "exec", "--reason", "给 CI 补一个 release tag",
+      "--item", "Example API", "password=EXAMPLE_TOKEN", "--", "tool",
+    ], context.deps)).toBe(7);
+  });
+
   test("approves several distinct items in one exec and injects every env", async () => {
     const context = makeDeps();
     expect(await main([

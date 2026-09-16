@@ -11,7 +11,7 @@ the child process's environment.
 ```
 code agent ──> secretary CLI ──HTTPS──> secretary broker ──> Bitwarden / Vaultwarden
                                               │
-                                              └──> Telegram (1h / 8h / 7d / reject)
+                                              └──> Telegram (1h / 8h / 7d / 30d / reject)
 ```
 
 ```sh
@@ -33,7 +33,7 @@ time-limited grants**:
   Grant or goes to the Owner's phone. No decision within the timeout →
   fail closed.
 - **Grants are narrow and expire.** Keyed by (caller, client, repo, item,
-  field) with TTLs of 1h / 8h / 7d. The same secret in a different repo needs
+  field) with TTLs of 1h / 8h / 7d / 30d. The same secret in a different repo needs
   its own approval.
 - **Inline code never earns trust.** `sh -c`, `python -c`, `node -e` (and
   their combined-flag and `env`-wrapped variants) always require approval and

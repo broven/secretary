@@ -310,7 +310,7 @@ export type TelegramInlineKeyboard = {
   inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
 };
 
-type ApprovalActionKey = "approve_1h" | "approve_8h" | "approve_7d" | "approve_once" | "deny";
+type ApprovalActionKey = "approve_1h" | "approve_8h" | "approve_7d" | "approve_30d" | "approve_once" | "deny";
 type ApprovalAction = { key: ApprovalActionKey; label: string; style: "primary" | "neutral" | "danger" };
 
 const DENY_ACTION: ApprovalAction = { key: "deny", label: "拒绝", style: "danger" };
@@ -324,6 +324,7 @@ function approvalActions(inlineShell: boolean): ApprovalAction[] {
     { key: "approve_1h", label: "批准 1 小时", style: "primary" },
     { key: "approve_8h", label: "批准 8 小时", style: "neutral" },
     { key: "approve_7d", label: "批准 7 天", style: "neutral" },
+    { key: "approve_30d", label: "批准 30 天", style: "neutral" },
     DENY_ACTION,
   ];
 }

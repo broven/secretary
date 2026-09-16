@@ -36,7 +36,7 @@ reason. A Request either hits Grants (fast path) or becomes an Approval.
 ## Approval
 
 An Owner decision on a Request, delivered through an Approver channel. Approving
-carries a TTL choice (1h / 8h / 7d) and creates Grants; rejecting fails the
+carries a TTL choice (1h / 8h / 7d / 30d) and creates Grants; rejecting fails the
 Request. No decision within the window fails closed — but the window belongs to
 the Broker, not to whoever is waiting: the Client stops waiting long before it
 closes (ADR-0006). On a Write Request there

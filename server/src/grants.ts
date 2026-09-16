@@ -33,7 +33,7 @@ export const GRANT_REVOCATION_TABLE = "secret_grant_revocations";
 const ITEM_REVOCATION_SCOPE = "";
 
 /** Sightings only answer "have we seen this command"; 90 days covers the
- * reuse window of the longest 7d grant. */
+ * reuse window of the longest 30d grant. */
 export const SIGHTING_RETENTION_DAYS = 90;
 const SIGHTING_RETENTION_MS = SIGHTING_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 

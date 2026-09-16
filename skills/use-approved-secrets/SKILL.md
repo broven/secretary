@@ -96,7 +96,7 @@ Report the command result or the approval failure. **Never report a credential v
 
 ### What one approval covers
 
-The Owner picks 1 hour, 8 hours, or 7 days. The authorization is stored per
+The Owner picks 1 hour, 8 hours, 7 days, or 30 days. The authorization is stored per
 **(caller, client, repository, item, field)** and matched by containment:
 
 - Requesting a **subset** of what was approved reuses it silently.
