@@ -1,0 +1,42 @@
+[tools]
+bun = "1.3.10"
+shellcheck = "0.11.0"
+actionlint = "1.7.12"
+
+[tasks.install]
+description = "Install all workspace dependencies from the lockfile"
+run = "bun install --frozen-lockfile"
+
+[tasks.dev]
+description = "Show the available development entry points"
+run = '''
+printf '%s\n' \
+  'No single default dev process.' \
+  '  mise run dev:broker  # broker from source; needs broker configuration' \
+  '  mise run smoke       # disposable full-stack end-to-end test'
+'''
+
+[tasks."dev:broker"]
+description = "Run the broker from source using the current environment"
+run = "bun run server/src/main.ts"
+
+[tasks.test]
+description = "Run the complete hermetic unit and integration test suite"
+run = "bun test"
+
+[tasks.lint]
+description = "Lint shell entrypoints and GitHub Actions workflows"
+run = '''
+shellcheck -e SC2016 install.sh skills/use-approved-secrets/install.sh
+shellcheck cli/build.sh
+shellcheck -e SC2154 cli/scripts/secretary
+actionlint
+'''
+
+[tasks.build]
+description = "Test and compile the local CLI binary"
+run = "sh cli/build.sh"
+
+[tasks.smoke]
+description = "Run the disposable Docker Compose end-to-end smoke test"
+run = "bun run deploy/smoke.ts"

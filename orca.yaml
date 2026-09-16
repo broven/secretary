@@ -1,0 +1,5 @@
+scripts:
+  setup: |
+    wt hook post-create --yes || true
+  archive: |
+    wt hook pre-remove --yes || true

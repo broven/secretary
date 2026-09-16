@@ -1,0 +1,2 @@
+[post-create]
+setup = "mise trust && mise install && mise run install"

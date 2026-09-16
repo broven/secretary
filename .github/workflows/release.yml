@@ -21,16 +21,15 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
+      - uses: jdx/mise-action@v4
 
-      - run: bun install --frozen-lockfile
+      - name: Install dependencies
+        run: mise run install
 
       # The whole suite, not just the CLI's: a broker change that breaks the
       # wire contract must not ship a client that speaks it.
       - name: Test
-        run: bun test
+        run: mise run test
 
       - name: Build every target
         env:
