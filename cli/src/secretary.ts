@@ -1,16 +1,19 @@
 #!/usr/bin/env bun
-// Self-contained secretary client. Runtime dependencies: macOS Keychain
-// (optional; SECRETARY_* env vars work everywhere) and HTTPS only.
+// Self-contained secretary client. Runtime dependencies: macOS Keychain or the
+// Linux XDG user config file (optional; SECRETARY_* env vars work everywhere)
+// and HTTPS only.
 //
 // Wire contract mirrors server/src/types.ts and server/src/envelope.ts — this
 // file must stay a single self-contained module (no imports from server/).
 
-import { realpath, stat } from "node:fs/promises";
+import { lstat, mkdir, open, realpath, rename, stat, unlink } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { createInterface } from "node:readline/promises";
 import { createHash } from "node:crypto";
-import { basename, resolve as resolvePath } from "node:path";
+import { basename, join, resolve as resolvePath } from "node:path";
 import { hostname, userInfo } from "node:os";
 
-// Keychain locations for the three config settings. Env vars always win.
+// Platform storage locations for the three config settings. Env vars always win.
 export const URL_SERVICE = "secretary-url";
 export const TOKEN_SERVICE = "secretary-token";
 export const CLIENT_SERVICE = "secretary-client-id";
@@ -129,10 +132,13 @@ export type Keychain = {
   delete(service: string, account: string): Promise<void>;
 };
 
+export type ClientPlatform = "darwin" | "linux" | "unsupported";
+
 export type ClientDeps = {
   env: Record<string, string | undefined>;
   fetch: typeof fetch;
   keychain: Keychain;
+  platform?: ClientPlatform;
   realpath: typeof realpath;
   stat: typeof stat;
   now: () => number;
@@ -145,6 +151,8 @@ export type ClientDeps = {
   stderr: (message: string) => void;
   /** Whole stdin as text. Field values arrive here and never through argv. */
   readStdin: () => Promise<string>;
+  /** Read a secret from an interactive terminal without echoing it. */
+  promptSecret?: () => Promise<string>;
   onInterrupt?: (handler: () => void) => () => void;
 };
 
@@ -586,20 +594,272 @@ export function describeTlsCertError(host: string, error: unknown): Error {
 }
 
 // ---------------------------------------------------------------------------
-// Config resolution: env var wins over keychain; each setting has one home.
+// Config resolution: environment variables win over platform storage. macOS
+// uses Keychain; Linux uses a deliberately small, permission-checked JSON file.
 
-export type SettingSource = "env" | "keychain";
+export type SettingSource = "env" | "keychain" | "file";
 export type BrokerConfig = { url: string; token: string; clientId?: string };
+type LinuxConfig = { url?: string; token?: string; clientId?: string };
+
+const LINUX_CONFIG_DIR_MODE = 0o700;
+const LINUX_CONFIG_FILE_MODE = 0o600;
+const MAX_LINUX_CONFIG_BYTES = 16 * 1024;
+
+function isMissingFile(error: unknown): boolean {
+  return !!error && typeof error === "object" && (error as { code?: unknown }).code === "ENOENT";
+}
+
+function currentUserId(): number {
+  const uid = process.getuid?.();
+  if (uid === undefined) throw new Error("无法确认当前用户，拒绝访问 secretary Linux 配置");
+  return uid;
+}
+
+export function linuxConfigPaths(env: Record<string, string | undefined> = process.env): { directory: string; file: string } {
+  let base = env.XDG_CONFIG_HOME?.trim();
+  if (!base) {
+    let home = env.HOME?.trim();
+    if (!home) {
+      try {
+        home = userInfo().homedir;
+      } catch {
+        throw new Error("无法确定 HOME，拒绝访问 secretary Linux 配置");
+      }
+    }
+    base = join(home, ".config");
+  }
+  if (!base.startsWith("/")) throw new Error("XDG_CONFIG_HOME 必须是绝对路径");
+  const directory = join(base, "secretary");
+  return { directory, file: join(directory, "config.json") };
+}
+
+function securedLinuxDirectoryPath(directory: string, handle: { fd: number }): string {
+  // Linux keeps the directory inode pinned while the caller checks and mutates
+  // its children. The macOS test seam uses the ordinary path because this
+  // store is selected only on Linux in production.
+  return process.platform === "linux" ? `/proc/self/fd/${handle.fd}` : directory;
+}
+
+async function openLinuxDirectory(directory: string) {
+  const flags = fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY ?? 0) | (fsConstants.O_NOFOLLOW ?? 0);
+  return await open(directory, flags);
+}
+
+function assertOwnedMode(path: string, info: { uid?: number; mode: number }, expectedMode: number): void {
+  if (info.uid !== currentUserId()) throw new Error(`secretary 配置所有者不安全：${path}`);
+  if ((info.mode & 0o7777) !== expectedMode) {
+    throw new Error(`secretary 配置权限不安全：${path}（需要 ${expectedMode.toString(8)}）`);
+  }
+}
+
+function validateLinuxConfig(value: unknown): LinuxConfig {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("secretary Linux 配置 JSON 无效：必须是对象");
+  }
+  const record = value as Record<string, unknown>;
+  const allowed = new Set(["url", "token", "clientId"]);
+  const unknown = Object.keys(record).filter((key) => !allowed.has(key));
+  if (unknown.length) throw new Error(`secretary Linux 配置含未知字段：${unknown.join(", ")}`);
+  const result: LinuxConfig = {};
+  if ("url" in record) {
+    if (typeof record.url !== "string" || !record.url.trim()) throw new Error("secretary Linux 配置中的 url 无效");
+    result.url = normalizeBrokerUrl(record.url);
+  }
+  if ("token" in record) {
+    if (typeof record.token !== "string" || !record.token.trim() || record.token.length > 8192 || /[\u0000-\u001f\u007f]/.test(record.token)) {
+      throw new Error("secretary Linux 配置中的 token 无效");
+    }
+    result.token = record.token;
+  }
+  if ("clientId" in record) {
+    if (typeof record.clientId !== "string" || !record.clientId.trim() || record.clientId.length > 200 || /[\u0000-\u001f\u007f]/.test(record.clientId)) {
+      throw new Error("secretary Linux 配置中的 clientId 无效");
+    }
+    result.clientId = record.clientId;
+  }
+  return result;
+}
+
+async function readLinuxConfig(env: Record<string, string | undefined>): Promise<LinuxConfig> {
+  const { directory, file } = linuxConfigPaths(env);
+  let dirInfo;
+  try {
+    dirInfo = await lstat(directory);
+  } catch (error) {
+    if (isMissingFile(error)) return {};
+    throw new Error(`无法检查 secretary 配置目录：${String(error)}`);
+  }
+  if (dirInfo.isSymbolicLink()) throw new Error(`secretary 配置目录是符号链接，拒绝访问：${directory}`);
+  if (!dirInfo.isDirectory()) throw new Error(`secretary 配置目录不是目录：${directory}`);
+  assertOwnedMode(directory, dirInfo, LINUX_CONFIG_DIR_MODE);
+
+  const directoryHandle = await openLinuxDirectory(directory);
+  try {
+    const securedDirectory = securedLinuxDirectoryPath(directory, directoryHandle);
+    const securedFile = join(securedDirectory, "config.json");
+    let fileInfo;
+    try {
+      fileInfo = await lstat(securedFile);
+    } catch (error) {
+      if (isMissingFile(error)) return {};
+      throw new Error(`无法检查 secretary 配置文件：${String(error)}`);
+    }
+    if (fileInfo.isSymbolicLink()) throw new Error(`secretary 配置文件是符号链接，拒绝访问：${file}`);
+    if (!fileInfo.isFile()) throw new Error(`secretary 配置路径不是普通文件：${file}`);
+    assertOwnedMode(file, fileInfo, LINUX_CONFIG_FILE_MODE);
+
+    const flags = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0);
+    const handle = await open(securedFile, flags);
+    try {
+      const openedInfo = await handle.stat();
+      if (!openedInfo.isFile()) throw new Error(`secretary 配置路径不是普通文件：${file}`);
+      assertOwnedMode(file, openedInfo, LINUX_CONFIG_FILE_MODE);
+      if (openedInfo.size > MAX_LINUX_CONFIG_BYTES) throw new Error("secretary Linux 配置文件过大");
+      let text: string;
+      try {
+        text = await handle.readFile({ encoding: "utf8" });
+      } catch {
+        throw new Error("无法读取 secretary Linux 配置文件");
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        throw new Error("secretary Linux 配置 JSON 无效");
+      }
+      return validateLinuxConfig(parsed);
+    } finally {
+      await handle.close();
+    }
+  } finally {
+    await directoryHandle.close();
+  }
+}
+
+async function ensureLinuxConfigDirectory(env: Record<string, string | undefined>): Promise<string> {
+  const { directory } = linuxConfigPaths(env);
+  try {
+    await mkdir(directory, { recursive: true, mode: LINUX_CONFIG_DIR_MODE });
+  } catch (error) {
+    throw new Error(`无法创建 secretary 配置目录：${String(error)}`);
+  }
+  const info = await lstat(directory);
+  if (info.isSymbolicLink()) throw new Error(`secretary 配置目录是符号链接，拒绝写入：${directory}`);
+  if (!info.isDirectory()) throw new Error(`secretary 配置目录不是目录：${directory}`);
+  assertOwnedMode(directory, info, LINUX_CONFIG_DIR_MODE);
+  return directory;
+}
+
+async function updateLinuxConfig(
+  env: Record<string, string | undefined>,
+  update: (config: LinuxConfig) => LinuxConfig,
+): Promise<void> {
+  const current = await readLinuxConfig(env);
+  const next = validateLinuxConfig(update({ ...current }));
+  const directory = await ensureLinuxConfigDirectory(env);
+  const directoryHandle = await openLinuxDirectory(directory);
+  let temporary: string | undefined;
+  let handle;
+  try {
+    const securedDirectory = securedLinuxDirectoryPath(directory, directoryHandle);
+    temporary = join(securedDirectory, `.config.json.${process.pid}.${crypto.randomUUID()}.tmp`);
+    const file = join(securedDirectory, "config.json");
+    const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0);
+    handle = await open(temporary, flags, LINUX_CONFIG_FILE_MODE);
+    await handle.writeFile(`${JSON.stringify(next)}\n`, { encoding: "utf8" });
+    // Keep the descriptor open while checking and setting its mode. This avoids
+    // a pathname race where a same-user process swaps the temporary path for a
+    // symlink between close() and chmod().
+    await handle.chmod(LINUX_CONFIG_FILE_MODE);
+    const temporaryInfo = await handle.stat();
+    if (!temporaryInfo.isFile()) throw new Error("临时配置文件不是普通文件");
+    assertOwnedMode(temporary, temporaryInfo, LINUX_CONFIG_FILE_MODE);
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await rename(temporary, file);
+    temporary = undefined;
+  } catch (error) {
+    if (handle) await handle.close().catch(() => undefined);
+    if (temporary) await unlink(temporary).catch(() => undefined);
+    throw new Error(`无法原子写入 secretary Linux 配置：${String(error)}`);
+  } finally {
+    await directoryHandle.close();
+  }
+}
+
+async function deleteLinuxConfig(env: Record<string, string | undefined>): Promise<void> {
+  const { directory, file } = linuxConfigPaths(env);
+  let dirInfo;
+  try {
+    dirInfo = await lstat(directory);
+  } catch (error) {
+    if (isMissingFile(error)) return;
+    throw new Error(`无法检查 secretary 配置目录：${String(error)}`);
+  }
+  if (dirInfo.isSymbolicLink()) throw new Error(`secretary 配置目录是符号链接，拒绝删除：${directory}`);
+  if (!dirInfo.isDirectory()) throw new Error(`secretary 配置目录不是目录：${directory}`);
+  if (dirInfo.uid !== currentUserId()) throw new Error(`secretary 配置目录所有者不安全：${directory}`);
+
+  const directoryHandle = await openLinuxDirectory(directory);
+  try {
+    const securedFile = join(securedLinuxDirectoryPath(directory, directoryHandle), "config.json");
+    let fileInfo;
+    try {
+      fileInfo = await lstat(securedFile);
+    } catch (error) {
+      if (isMissingFile(error)) return;
+      throw new Error(`无法检查 secretary 配置文件：${String(error)}`);
+    }
+    if (fileInfo.uid !== currentUserId()) throw new Error(`secretary 配置文件所有者不安全：${file}`);
+    if (!fileInfo.isFile() && !fileInfo.isSymbolicLink()) throw new Error(`secretary 配置路径不是普通文件：${file}`);
+    await unlink(securedFile);
+  } finally {
+    await directoryHandle.close();
+  }
+}
+
+function linuxConfigField(service: string): keyof LinuxConfig {
+  if (service === URL_SERVICE) return "url";
+  if (service === TOKEN_SERVICE) return "token";
+  if (service === CLIENT_SERVICE) return "clientId";
+  throw new Error(`未知 secretary 配置项：${service}`);
+}
+
+export function createLinuxConfigStore(
+  env: Record<string, string | undefined> = process.env,
+  promptSecret: () => Promise<string> = promptHiddenSecret,
+): Keychain {
+  return {
+    read: async (service) => {
+      const config = await readLinuxConfig(env);
+      return config[linuxConfigField(service)] ?? null;
+    },
+    write: async (service, _account, value) => {
+      const field = linuxConfigField(service);
+      await updateLinuxConfig(env, (config) => ({ ...config, [field]: value }));
+    },
+    promptWrite: async (service, _account) => {
+      const value = await promptSecret();
+      if (!value) throw new Error("secretary token 不能为空");
+      const field = linuxConfigField(service);
+      await updateLinuxConfig(env, (config) => ({ ...config, [field]: value }));
+    },
+    delete: async () => deleteLinuxConfig(env),
+  };
+}
 
 async function resolveSetting(
   deps: ClientDeps,
   envName: string,
   service: string,
 ): Promise<{ value: string; source: SettingSource } | null> {
+  // Read platform storage even when an environment value exists: malformed or
+  // unsafe on-disk configuration must never be hidden by an override.
+  const fromStored = (await deps.keychain.read(service, KEYCHAIN_ACCOUNT))?.trim();
   const fromEnv = deps.env[envName]?.trim();
   if (fromEnv) return { value: fromEnv, source: "env" };
-  const fromKeychain = (await deps.keychain.read(service, KEYCHAIN_ACCOUNT))?.trim();
-  if (fromKeychain) return { value: fromKeychain, source: "keychain" };
+  if (fromStored) return { value: fromStored, source: deps.platform === "linux" ? "file" : "keychain" };
   return null;
 }
 
@@ -834,24 +1094,29 @@ function formatCatalog(catalog: CatalogResponse): string {
   return [headers, ...rows].map((row) => row.map((cell, index) => cell.padEnd(widths[index])).join("  ").trimEnd()).join("\n") + "\n";
 }
 
+function configStorageLabel(deps: ClientDeps): string {
+  return deps.platform === "linux" ? "Linux XDG 配置文件" : "macOS Keychain";
+}
+
 async function runAuth(invocation: Extract<ParsedInvocation, { action: "auth" }>, deps: ClientDeps): Promise<void> {
+  const storage = configStorageLabel(deps);
   switch (invocation.authAction) {
     case "import": {
       await deps.keychain.promptWrite(TOKEN_SERVICE, KEYCHAIN_ACCOUNT);
-      deps.stdout("secretary token 已保存到 macOS Keychain。\n");
+      deps.stdout(`secretary token 已保存到 ${storage}。\n`);
       return;
     }
     case "set-url": {
       const url = normalizeBrokerUrl(invocation.value ?? "");
       await deps.keychain.write(URL_SERVICE, KEYCHAIN_ACCOUNT, url);
-      deps.stdout(`secretary broker 地址已保存到 macOS Keychain：${url}\n`);
+      deps.stdout(`secretary broker 地址已保存到 ${storage}：${url}\n`);
       return;
     }
     case "set-client-id": {
       const id = (invocation.value ?? "").trim();
       if (!id || id.length > 200 || /[\u0000-\u001f\u007f]/.test(id)) throw new Error("client-id 无效");
       await deps.keychain.write(CLIENT_SERVICE, KEYCHAIN_ACCOUNT, id);
-      deps.stdout("secretary client-id 已保存到 macOS Keychain。\n");
+      deps.stdout(`secretary client-id 已保存到 ${storage}。\n`);
       return;
     }
     case "status": {
@@ -864,18 +1129,25 @@ async function runAuth(invocation: Extract<ParsedInvocation, { action: "auth" }>
       const lines: string[] = [];
       for (const [label, envName, service] of settings) {
         const setting = await resolveSetting(deps, envName, service);
+        const source = setting?.source === "env"
+          ? `环境变量 ${envName}`
+          : setting?.source === "file" ? "Linux XDG 配置文件" : "Keychain";
         lines.push(setting
-          ? `${label}：已配置（来源：${setting.source === "env" ? `环境变量 ${envName}` : "Keychain"}）`
+          ? `${label}：已配置（来源：${source}）`
           : `${label}：未配置`);
       }
       deps.stdout(lines.join("\n") + "\n");
       return;
     }
     case "delete": {
-      for (const service of [URL_SERVICE, TOKEN_SERVICE, CLIENT_SERVICE]) {
-        await deps.keychain.delete(service, KEYCHAIN_ACCOUNT);
+      if (deps.platform === "linux") {
+        await deps.keychain.delete(URL_SERVICE, KEYCHAIN_ACCOUNT);
+      } else {
+        for (const service of [URL_SERVICE, TOKEN_SERVICE, CLIENT_SERVICE]) {
+          await deps.keychain.delete(service, KEYCHAIN_ACCOUNT);
+        }
       }
-      deps.stdout("secretary 配置已从 macOS Keychain 删除。\n");
+      deps.stdout(`secretary 配置已从 ${storage} 删除。\n`);
       return;
     }
   }
@@ -1263,9 +1535,54 @@ const darwinKeychain: Keychain = {
   },
 };
 
-// Off macOS there is no keychain: reads resolve to "not configured" so the
-// SECRETARY_* env vars remain the sole config channel; writes fail loudly.
-const KEYCHAIN_UNAVAILABLE = "Keychain unavailable; use SECRETARY_* environment variables";
+async function promptHiddenSecret(): Promise<string> {
+  if (!process.stdin.isTTY) throw new Error("auth import 需要交互式终端；token 不接受命令行参数");
+  const disableEcho = Bun.spawn(["/bin/stty", "-echo"], {
+    stdin: "inherit", stdout: "ignore", stderr: "ignore",
+  });
+  if (await disableEcho.exited !== 0) throw new Error("无法关闭终端回显，拒绝读取 token");
+
+  let echoDisabled = true;
+  let restoringEcho = false;
+  const restoreEcho = async (): Promise<void> => {
+    if (!echoDisabled || restoringEcho) return;
+    restoringEcho = true;
+    const enableEcho = Bun.spawn(["/bin/stty", "echo"], {
+      stdin: "inherit", stdout: "ignore", stderr: "ignore",
+    });
+    await enableEcho.exited;
+    echoDisabled = false;
+  };
+  const interrupt = (signal: "SIGINT" | "SIGTERM"): void => {
+    void restoreEcho().finally(() => {
+      process.off("SIGINT", onInterrupt);
+      process.off("SIGTERM", onTerminate);
+      process.kill(process.pid, signal);
+    });
+  };
+  const onInterrupt = (): void => interrupt("SIGINT");
+  const onTerminate = (): void => interrupt("SIGTERM");
+  process.once("SIGINT", onInterrupt);
+  process.once("SIGTERM", onTerminate);
+  const input = createInterface({ input: process.stdin, output: process.stderr, terminal: false });
+  try {
+    process.stderr.write("请输入 secretary token：");
+    const first = await input.question("");
+    process.stderr.write("\n请再次输入 secretary token：");
+    const second = await input.question("");
+    process.stderr.write("\n");
+    if (first !== second) throw new Error("两次输入的 token 不一致，未保存");
+    if (!first) throw new Error("secretary token 不能为空");
+    return first;
+  } finally {
+    input.close();
+    process.off("SIGINT", onInterrupt);
+    process.off("SIGTERM", onTerminate);
+    await restoreEcho();
+  }
+}
+
+const KEYCHAIN_UNAVAILABLE = "当前平台没有 secretary 配置存储；请使用支持的平台或 SECRETARY_* 环境变量";
 const unavailableKeychain: Keychain = {
   read: async () => null,
   write: async () => { throw new Error(KEYCHAIN_UNAVAILABLE); },
@@ -1273,12 +1590,15 @@ const unavailableKeychain: Keychain = {
   delete: async () => { throw new Error(KEYCHAIN_UNAVAILABLE); },
 };
 
-export const defaultKeychain: Keychain = process.platform === "darwin" ? darwinKeychain : unavailableKeychain;
+export const defaultKeychain: Keychain = process.platform === "darwin"
+  ? darwinKeychain
+  : process.platform === "linux" ? createLinuxConfigStore() : unavailableKeychain;
 
 export const defaultDeps: ClientDeps = {
   env: process.env,
   fetch,
   keychain: defaultKeychain,
+  platform: process.platform === "darwin" || process.platform === "linux" ? process.platform : "unsupported",
   realpath,
   stat,
   now: Date.now,
@@ -1298,6 +1618,7 @@ export const defaultDeps: ClientDeps = {
   stdout: (message) => process.stdout.write(message),
   stderr: (message) => process.stderr.write(`${message}\n`),
   readStdin: () => Bun.stdin.text(),
+  promptSecret: promptHiddenSecret,
   onInterrupt: (handler) => {
     process.once("SIGINT", handler);
     process.once("SIGTERM", handler);

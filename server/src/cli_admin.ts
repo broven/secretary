@@ -26,7 +26,7 @@ export function runAdmin(
       const created = registry.add(name);
       stdout(`client_id: ${created.client_id}`);
       stdout(`token:     ${created.token}`);
-      stdout("The token is shown only this once; store it in the agent machine's Keychain (secretary auth import).");
+      stdout("The token is shown only this once; store it with `secretary auth import` (macOS Keychain or the Linux user config file).");
       return 0;
     }
     if (action === "list" && !name) {

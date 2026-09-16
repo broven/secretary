@@ -149,7 +149,10 @@ into an agent's conversation.
       https://secretary.example.com or http://100.64.0.1:8787
 
   approved-secret auth import
-      Pastes the client token. Get it on the broker host with:
+      Reads the client token twice without echoing it. On macOS it is saved in
+      Keychain; on Linux it is saved in
+      ${XDG_CONFIG_HOME:-$HOME/.config}/secretary/config.json with restrictive
+      ownership and permissions. Get the token on the broker host with:
         docker compose exec broker bun run server/src/cli_admin.ts client add <a name for this machine>
       It prints a client_id and a token, and shows the token exactly once.
 

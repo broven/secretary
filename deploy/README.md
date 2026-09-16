@@ -136,8 +136,13 @@ By hand:
 2. Put `cli/scripts/secretary` on your `PATH`.
 3. Store the config:
    - macOS: `secretary auth set-url https://your-broker.example.com` then
-     `secretary auth import` (token goes into the Keychain).
-   - Linux (or CI): export `SECRETARY_URL` and `SECRETARY_TOKEN` instead.
+     `secretary auth import` (the token is read twice without echo and goes into Keychain).
+   - Linux: use the same `auth set-url`, `auth import` and optional
+     `auth set-client-id` commands. They store
+     `${XDG_CONFIG_HOME:-$HOME/.config}/secretary/config.json` with directory
+     mode `0700` and file mode `0600`.
+   - CI or other automated runs: export `SECRETARY_URL`, `SECRETARY_TOKEN` and
+     optional `SECRETARY_CLIENT_ID`; environment variables override platform storage.
 
 ## 7. Smoke test
 
