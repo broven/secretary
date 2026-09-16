@@ -150,6 +150,11 @@ input[type=password] { width:100%; box-sizing:border-box; padding:.6rem .7rem; f
   border:1px solid #c9c9cf; border-radius:8px; background:inherit; color:inherit; }
 button { width:100%; padding:.7rem; font-size:1rem; font-weight:600; border:0; border-radius:8px;
   background:#2f6feb; color:#fff; cursor:pointer; }
+button[disabled] { cursor:wait; opacity:.8; }
+button[disabled]::before { content:""; display:inline-block; width:.8em; height:.8em; margin-right:.45em;
+  border:.15em solid rgba(255,255,255,.45); border-top-color:#fff; border-radius:50%;
+  vertical-align:-.1em; animation:entry-spin .8s linear infinite; }
+@keyframes entry-spin { to { transform:rotate(360deg); } }
 .note { margin-top:1rem; font-size:.82rem; opacity:.65; }
 .howto { margin:0 0 1.25rem; padding:.7rem .85rem; border-radius:8px; font-size:.88rem;
   background:#eef3fb; border:1px solid #d3e0f5; word-break:break-word; }
@@ -157,6 +162,16 @@ button { width:100%; padding:.7rem; font-size:1rem; font-weight:600; border:0; b
 .howto b { display:block; margin-bottom:.25rem; opacity:.7; font-weight:600; }
 .bad { color:#b3261e; } .good { color:#1a7f37; }
 `.trim();
+
+const ENTRY_SUBMIT_SCRIPT = `
+      document.querySelector("form")?.addEventListener("submit", () => {
+        const button = document.querySelector("button[type=submit]");
+        if (!(button instanceof HTMLButtonElement)) return;
+        button.disabled = true;
+        button.setAttribute("aria-busy", "true");
+        button.textContent = "写入中...";
+      });
+    `;
 
 function page(title: string, body: string): string {
   return `<!doctype html>
@@ -194,7 +209,8 @@ export function renderEntryPage(draft: EntryDraft<unknown>, error?: string): str
       ${inputs}
       <button type="submit">写入 vault</button>
     </form>
-    <p class="note">这个链接一次性有效，提交或过期后即失效。</p>`);
+    <p class="note">这个链接一次性有效，提交或过期后即失效。</p>
+    <script>${ENTRY_SUBMIT_SCRIPT}</script>`);
 }
 
 export function renderEntryDone(item: string): string {
@@ -220,7 +236,8 @@ export function renderEntryFailed(message: string): string {
     <p class="note">这个链接已失效，请让 agent 重新发起一次请求。</p>`);
 }
 
-/** Headers every Entry response carries: no caching, no referrer, no scripts. */
+/** Headers every Entry response carries: no caching, no referrer, and only the
+ * fixed submit-state script is allowed by hash - no external or user-authored scripts. */
 export const ENTRY_HEADERS: Record<string, string> = {
   "Content-Type": "text/html; charset=utf-8",
   "Cache-Control": "no-store, no-cache, must-revalidate",
@@ -228,5 +245,5 @@ export const ENTRY_HEADERS: Record<string, string> = {
   "X-Robots-Tag": "noindex, nofollow",
   "X-Content-Type-Options": "nosniff",
   "Content-Security-Policy":
-    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+    "default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-CA32xOsSHfTa0ORymsC89ZIpo4JVD63HIsXUrZJb9mY='; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
 };

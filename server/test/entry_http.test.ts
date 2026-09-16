@@ -2,6 +2,7 @@
 // and unknown / expired / spent links are indistinguishable from each other.
 
 import { afterEach, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { Database } from "bun:sqlite";
 import type {
   ApprovalCard,
@@ -13,7 +14,7 @@ import type {
   WriteNote,
 } from "../src/approver.ts";
 import { ClientRegistry } from "../src/clients.ts";
-import { renderEntryPage } from "../src/entry.ts";
+import { ENTRY_HEADERS, renderEntryPage } from "../src/entry.ts";
 import { GrantStore } from "../src/grants.ts";
 import { startHttpServer } from "../src/http.ts";
 import { RequestBroker } from "../src/requests.ts";
@@ -260,6 +261,12 @@ test("the entry form shows the How-to-get, escaped and with bare URLs linked", (
   });
   expect(html).toContain('<a href="https://acme.example/tokens" rel="noopener noreferrer nofollow"');
   expect(html).toContain("<br>新建一个 deploy token");
+  expect(html).toContain('button.disabled = true');
+  expect(html).toContain('button.textContent = "写入中..."');
+  const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+  expect(script).toBeDefined();
+  const hash = createHash("sha256").update(script ?? "").digest("base64");
+  expect(ENTRY_HEADERS["Content-Security-Policy"]).toContain(`script-src 'sha256-${hash}'`);
 });
 
 test("agent prose can never inject markup into the page that collects the secret", () => {
