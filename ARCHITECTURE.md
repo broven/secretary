@@ -22,8 +22,8 @@ stays the source of truth), Windows support for the CLI (macOS/Linux first).
 │  code agent                  │  bearer  │  ┌───────────┐     ┌─────────────────┐  │
 │    └─> secretary CLI ────────┼──token──>│  │  broker    │──> │ vaultwarden     │  │
 │        (compiled Bun binary, │          │  │ (Bun/TS)   │    │ (optional        │  │
-│         token in Keychain)   │          │  │  SQLite    │    │  profile) or     │  │
-│                              │          │  │  bw CLI    │    │  external        │  │
+│         token in Keychain/  │          │  │  SQLite    │    │  profile) or     │  │
+│         Linux XDG file)     │          │  │  bw CLI    │    │  external        │  │
 └──────────────────────────────┘          │  │  session   │    │  Bitwarden(VAULT_URL)│
                                           │  └─────┬──────┘    └─────────────────┘  │
                                           └────────┼────────────────────────────────┘
@@ -35,10 +35,11 @@ stays the source of truth), Windows support for the CLI (macOS/Linux first).
 - **Skill** (`skills/use-approved-secrets/`): the agent-facing contract (`SKILL.md`) and its installer. It
   lives next to the CLI that implements it, because the previous split let the doc go
   on describing a retired system for months after the cutover.
-- **CLI** (`cli/`): argv parsing, env scrubbing (`env -i` wrapper), Keychain-stored
-  bearer token + client_id, repo identity from git remote, Envelope keygen and
-  decryption, child spawn with secrets injected. Ported from the existing
-  `approved-secret` CLI with the Windmill transport replaced by direct broker HTTP.
+- **CLI** (`cli/`): argv parsing, env scrubbing (`env -i` wrapper), platform-stored
+  bearer token + client_id (macOS Keychain or the protected Linux XDG config file),
+  repo identity from git remote, Envelope keygen and decryption, child spawn with
+  secrets injected. Ported from the existing `approved-secret` CLI with the
+  Windmill transport replaced by direct broker HTTP.
 - **Broker** (`server/`): the only stateful service. Owns the vault session, the
   Grant store (SQLite), the Approver (Telegram long-polling), Envelope encryption,
   inline-shell detection, Sightings. Ported from the existing Windmill
@@ -148,8 +149,10 @@ Ported unchanged from the predecessor:
   only as Fingerprints; `bw delete --permanent` is never reachable. Its transport
   threat model is deliberately weaker than the read path's — see ADR-0004.
 - **Client auth**: static per-client bearer token (issued by `secretary client
-  add`), Keychain-stored. A stolen token can *request*, but cannot *receive*
-  without Owner approval or a live Grant on that same client identity.
+  add`), stored in macOS Keychain or the protected Linux XDG user config file.
+  Environment variables override platform storage. A stolen token can *request*,
+  but cannot *receive* without Owner approval or a live Grant on that same client
+  identity.
 - **Broker credentials**: every secret env (`BW_CLIENTSECRET`, `BW_PASSWORD`,
   Telegram bot token, …) accepts a `_FILE` variant; docker secrets are the
   documented default, plain env works.

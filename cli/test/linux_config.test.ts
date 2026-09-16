@@ -23,6 +23,12 @@ async function withConfig<T>(fn: (env: Record<string, string | undefined>) => Pr
 }
 
 describe("Linux user config store", () => {
+  test("the installed wrapper preserves XDG_CONFIG_HOME through its env scrub", async () => {
+    const wrapper = await Bun.file(new URL("../scripts/secretary", import.meta.url)).text();
+    expect(wrapper).toContain("NODE_EXTRA_CA_CERTS XDG_CONFIG_HOME SECRETARY_CLIENT_ID");
+    expect(wrapper).toContain('XDG_CONFIG_HOME="${XDG_CONFIG_HOME-}"');
+  });
+
   test("persists individual fields with strict ownership and modes", async () => {
     await withConfig(async (env) => {
       const store = createLinuxConfigStore(env, async () => "token-from-terminal");

@@ -6,7 +6,7 @@
 // Wire contract mirrors server/src/types.ts and server/src/envelope.ts — this
 // file must stay a single self-contained module (no imports from server/).
 
-import { chmod, lstat, mkdir, open, realpath, rename, stat, unlink } from "node:fs/promises";
+import { lstat, mkdir, open, realpath, rename, stat, unlink } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { createInterface } from "node:readline/promises";
 import { createHash } from "node:crypto";
@@ -616,18 +616,33 @@ function currentUserId(): number {
 }
 
 export function linuxConfigPaths(env: Record<string, string | undefined> = process.env): { directory: string; file: string } {
-  let home = env.HOME?.trim();
-  if (!home) {
-    try {
-      home = userInfo().homedir;
-    } catch {
-      throw new Error("无法确定 HOME，拒绝访问 secretary Linux 配置");
+  let base = env.XDG_CONFIG_HOME?.trim();
+  if (!base) {
+    let home = env.HOME?.trim();
+    if (!home) {
+      try {
+        home = userInfo().homedir;
+      } catch {
+        throw new Error("无法确定 HOME，拒绝访问 secretary Linux 配置");
+      }
     }
+    base = join(home, ".config");
   }
-  const base = env.XDG_CONFIG_HOME?.trim() || join(home, ".config");
   if (!base.startsWith("/")) throw new Error("XDG_CONFIG_HOME 必须是绝对路径");
   const directory = join(base, "secretary");
   return { directory, file: join(directory, "config.json") };
+}
+
+function securedLinuxDirectoryPath(directory: string, handle: { fd: number }): string {
+  // Linux keeps the directory inode pinned while the caller checks and mutates
+  // its children. The macOS test seam uses the ordinary path because this
+  // store is selected only on Linux in production.
+  return process.platform === "linux" ? `/proc/self/fd/${handle.fd}` : directory;
+}
+
+async function openLinuxDirectory(directory: string) {
+  const flags = fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY ?? 0) | (fsConstants.O_NOFOLLOW ?? 0);
+  return await open(directory, flags);
 }
 
 function assertOwnedMode(path: string, info: { uid?: number; mode: number }, expectedMode: number): void {
@@ -678,39 +693,46 @@ async function readLinuxConfig(env: Record<string, string | undefined>): Promise
   if (!dirInfo.isDirectory()) throw new Error(`secretary 配置目录不是目录：${directory}`);
   assertOwnedMode(directory, dirInfo, LINUX_CONFIG_DIR_MODE);
 
-  let fileInfo;
+  const directoryHandle = await openLinuxDirectory(directory);
   try {
-    fileInfo = await lstat(file);
-  } catch (error) {
-    if (isMissingFile(error)) return {};
-    throw new Error(`无法检查 secretary 配置文件：${String(error)}`);
-  }
-  if (fileInfo.isSymbolicLink()) throw new Error(`secretary 配置文件是符号链接，拒绝访问：${file}`);
-  if (!fileInfo.isFile()) throw new Error(`secretary 配置路径不是普通文件：${file}`);
-  assertOwnedMode(file, fileInfo, LINUX_CONFIG_FILE_MODE);
+    const securedDirectory = securedLinuxDirectoryPath(directory, directoryHandle);
+    const securedFile = join(securedDirectory, "config.json");
+    let fileInfo;
+    try {
+      fileInfo = await lstat(securedFile);
+    } catch (error) {
+      if (isMissingFile(error)) return {};
+      throw new Error(`无法检查 secretary 配置文件：${String(error)}`);
+    }
+    if (fileInfo.isSymbolicLink()) throw new Error(`secretary 配置文件是符号链接，拒绝访问：${file}`);
+    if (!fileInfo.isFile()) throw new Error(`secretary 配置路径不是普通文件：${file}`);
+    assertOwnedMode(file, fileInfo, LINUX_CONFIG_FILE_MODE);
 
-  const flags = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0);
-  const handle = await open(file, flags);
-  try {
-    const openedInfo = await handle.stat();
-    if (!openedInfo.isFile()) throw new Error(`secretary 配置路径不是普通文件：${file}`);
-    assertOwnedMode(file, openedInfo, LINUX_CONFIG_FILE_MODE);
-    if (openedInfo.size > MAX_LINUX_CONFIG_BYTES) throw new Error("secretary Linux 配置文件过大");
-    let text: string;
+    const flags = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0);
+    const handle = await open(securedFile, flags);
     try {
-      text = await handle.readFile({ encoding: "utf8" });
-    } catch {
-      throw new Error("无法读取 secretary Linux 配置文件");
+      const openedInfo = await handle.stat();
+      if (!openedInfo.isFile()) throw new Error(`secretary 配置路径不是普通文件：${file}`);
+      assertOwnedMode(file, openedInfo, LINUX_CONFIG_FILE_MODE);
+      if (openedInfo.size > MAX_LINUX_CONFIG_BYTES) throw new Error("secretary Linux 配置文件过大");
+      let text: string;
+      try {
+        text = await handle.readFile({ encoding: "utf8" });
+      } catch {
+        throw new Error("无法读取 secretary Linux 配置文件");
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        throw new Error("secretary Linux 配置 JSON 无效");
+      }
+      return validateLinuxConfig(parsed);
+    } finally {
+      await handle.close();
     }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      throw new Error("secretary Linux 配置 JSON 无效");
-    }
-    return validateLinuxConfig(parsed);
   } finally {
-    await handle.close();
+    await directoryHandle.close();
   }
 }
 
@@ -735,22 +757,34 @@ async function updateLinuxConfig(
   const current = await readLinuxConfig(env);
   const next = validateLinuxConfig(update({ ...current }));
   const directory = await ensureLinuxConfigDirectory(env);
-  const { file } = linuxConfigPaths(env);
-  const temporary = join(directory, `.config.json.${process.pid}.${crypto.randomUUID()}.tmp`);
-  const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0);
+  const directoryHandle = await openLinuxDirectory(directory);
+  let temporary: string | undefined;
   let handle;
   try {
+    const securedDirectory = securedLinuxDirectoryPath(directory, directoryHandle);
+    temporary = join(securedDirectory, `.config.json.${process.pid}.${crypto.randomUUID()}.tmp`);
+    const file = join(securedDirectory, "config.json");
+    const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0);
     handle = await open(temporary, flags, LINUX_CONFIG_FILE_MODE);
     await handle.writeFile(`${JSON.stringify(next)}\n`, { encoding: "utf8" });
+    // Keep the descriptor open while checking and setting its mode. This avoids
+    // a pathname race where a same-user process swaps the temporary path for a
+    // symlink between close() and chmod().
+    await handle.chmod(LINUX_CONFIG_FILE_MODE);
+    const temporaryInfo = await handle.stat();
+    if (!temporaryInfo.isFile()) throw new Error("临时配置文件不是普通文件");
+    assertOwnedMode(temporary, temporaryInfo, LINUX_CONFIG_FILE_MODE);
     await handle.sync();
     await handle.close();
     handle = undefined;
-    await chmod(temporary, LINUX_CONFIG_FILE_MODE);
     await rename(temporary, file);
+    temporary = undefined;
   } catch (error) {
     if (handle) await handle.close().catch(() => undefined);
-    await unlink(temporary).catch(() => undefined);
+    if (temporary) await unlink(temporary).catch(() => undefined);
     throw new Error(`无法原子写入 secretary Linux 配置：${String(error)}`);
+  } finally {
+    await directoryHandle.close();
   }
 }
 
@@ -767,16 +801,22 @@ async function deleteLinuxConfig(env: Record<string, string | undefined>): Promi
   if (!dirInfo.isDirectory()) throw new Error(`secretary 配置目录不是目录：${directory}`);
   if (dirInfo.uid !== currentUserId()) throw new Error(`secretary 配置目录所有者不安全：${directory}`);
 
-  let fileInfo;
+  const directoryHandle = await openLinuxDirectory(directory);
   try {
-    fileInfo = await lstat(file);
-  } catch (error) {
-    if (isMissingFile(error)) return;
-    throw new Error(`无法检查 secretary 配置文件：${String(error)}`);
+    const securedFile = join(securedLinuxDirectoryPath(directory, directoryHandle), "config.json");
+    let fileInfo;
+    try {
+      fileInfo = await lstat(securedFile);
+    } catch (error) {
+      if (isMissingFile(error)) return;
+      throw new Error(`无法检查 secretary 配置文件：${String(error)}`);
+    }
+    if (fileInfo.uid !== currentUserId()) throw new Error(`secretary 配置文件所有者不安全：${file}`);
+    if (!fileInfo.isFile() && !fileInfo.isSymbolicLink()) throw new Error(`secretary 配置路径不是普通文件：${file}`);
+    await unlink(securedFile);
+  } finally {
+    await directoryHandle.close();
   }
-  if (fileInfo.uid !== currentUserId()) throw new Error(`secretary 配置文件所有者不安全：${file}`);
-  if (!fileInfo.isFile() && !fileInfo.isSymbolicLink()) throw new Error(`secretary 配置路径不是普通文件：${file}`);
-  await unlink(file);
 }
 
 function linuxConfigField(service: string): keyof LinuxConfig {
@@ -1501,6 +1541,29 @@ async function promptHiddenSecret(): Promise<string> {
     stdin: "inherit", stdout: "ignore", stderr: "ignore",
   });
   if (await disableEcho.exited !== 0) throw new Error("无法关闭终端回显，拒绝读取 token");
+
+  let echoDisabled = true;
+  let restoringEcho = false;
+  const restoreEcho = async (): Promise<void> => {
+    if (!echoDisabled || restoringEcho) return;
+    restoringEcho = true;
+    const enableEcho = Bun.spawn(["/bin/stty", "echo"], {
+      stdin: "inherit", stdout: "ignore", stderr: "ignore",
+    });
+    await enableEcho.exited;
+    echoDisabled = false;
+  };
+  const interrupt = (signal: "SIGINT" | "SIGTERM"): void => {
+    void restoreEcho().finally(() => {
+      process.off("SIGINT", onInterrupt);
+      process.off("SIGTERM", onTerminate);
+      process.kill(process.pid, signal);
+    });
+  };
+  const onInterrupt = (): void => interrupt("SIGINT");
+  const onTerminate = (): void => interrupt("SIGTERM");
+  process.once("SIGINT", onInterrupt);
+  process.once("SIGTERM", onTerminate);
   const input = createInterface({ input: process.stdin, output: process.stderr, terminal: false });
   try {
     process.stderr.write("请输入 secretary token：");
@@ -1513,10 +1576,9 @@ async function promptHiddenSecret(): Promise<string> {
     return first;
   } finally {
     input.close();
-    const enableEcho = Bun.spawn(["/bin/stty", "echo"], {
-      stdin: "inherit", stdout: "ignore", stderr: "ignore",
-    });
-    await enableEcho.exited;
+    process.off("SIGINT", onInterrupt);
+    process.off("SIGTERM", onTerminate);
+    await restoreEcho();
   }
 }
 
