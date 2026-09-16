@@ -9,7 +9,7 @@ services:
       # your TLS ingress / tunnel (Caddy, Traefik, cloudflared, …) and only
       # widen the bind consciously:
       # - "0.0.0.0:8787:8787"
-      - "127.0.0.1:8787:8787"
+      - "127.0.0.1:${SECRETARY_BROKER_PORT:-8787}:8787"
     restart: unless-stopped
     volumes:
       - broker-data:/data

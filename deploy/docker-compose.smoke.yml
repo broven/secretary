@@ -13,7 +13,7 @@ services:
       - ./smoke-tls:/ssl:ro
   vaultwarden:
     ports:
-      - "127.0.0.1:18222:443"
+      - "127.0.0.1:${SECRETARY_VAULTWARDEN_PORT:-18222}:443"
     environment:
       SIGNUPS_ALLOWED: "true"
       I_REALLY_WANT_VOLATILE_STORAGE: "true"

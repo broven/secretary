@@ -9,6 +9,7 @@
 // report wall-clock timings. Cleans up the compose project at the end.
 
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -20,18 +21,18 @@ import {
 
 const REPO_ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 const DEPLOY = join(REPO_ROOT, "deploy");
+const WORKTREE_ID = createHash("sha256").update(REPO_ROOT).digest("hex").slice(0, 10);
+const COMPOSE_PROJECT = `secretary-smoke-${WORKTREE_ID}`;
 const COMPOSE = [
   "docker", "compose",
   "--profile", "vaultwarden",
-  "-p", "secretary-smoke",
+  "-p", COMPOSE_PROJECT,
   "-f", join(DEPLOY, "docker-compose.yml"),
   "-f", join(DEPLOY, "docker-compose.smoke.yml"),
 ];
 
-const VW_URL = "https://localhost:18222";
 const TLS_DIR = join(DEPLOY, "smoke-tls");
 const CA_FILE = join(TLS_DIR, "cert.pem");
-const BROKER_URL = "http://127.0.0.1:8787";
 const EMAIL = "secretary-smoke@example.com";
 const MASTER_PASSWORD = "smoke-master-password-1";
 const ITEM_NAME = "Smoke Test Item";
@@ -40,6 +41,25 @@ const BW_PATH = "/usr/local/bin/bw";
 
 function log(message: string) {
   console.log(`[smoke] ${message}`);
+}
+
+type PortReservation = { port: number; release: () => void };
+
+function reserveLoopbackPort(): PortReservation {
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch: () => new Response("reserved"),
+  });
+  let active = true;
+  return {
+    port: server.port,
+    release: () => {
+      if (!active) return;
+      active = false;
+      server.stop(true);
+    },
+  };
 }
 
 async function run(argv: string[], opts: { env?: Record<string, string>; input?: string } = {}) {
@@ -100,6 +120,17 @@ async function generateSmokeTls() {
 async function main() {
   const started = Date.now();
   const scratch = mkdtempSync(join(tmpdir(), "secretary-smoke-"));
+  const vaultwardenPort = reserveLoopbackPort();
+  const brokerPort = reserveLoopbackPort();
+  const vaultwardenUrl = `https://localhost:${vaultwardenPort.port}`;
+  const brokerUrl = `http://127.0.0.1:${brokerPort.port}`;
+  const composeEnv = {
+    BW_EMAIL: EMAIL,
+    TELEGRAM_CHAT_ID: "0",
+    TELEGRAM_ALLOWED_USER_IDS: "1",
+    SECRETARY_BROKER_PORT: String(brokerPort.port),
+    SECRETARY_VAULTWARDEN_PORT: String(vaultwardenPort.port),
+  };
   let composeUp = false;
   try {
     // Secret files the compose file mounts; the telegram token is a dummy —
@@ -111,27 +142,24 @@ async function main() {
     writeFileSync(join(DEPLOY, "secrets", "bw_clientid"), "pending", { mode: 0o600 });
     writeFileSync(join(DEPLOY, "secrets", "bw_clientsecret"), "pending", { mode: 0o600 });
 
-    const composeEnv = {
-      BW_EMAIL: EMAIL,
-      TELEGRAM_CHAT_ID: "0",
-      TELEGRAM_ALLOWED_USER_IDS: "1",
-    };
-
+    log(`using compose project ${COMPOSE_PROJECT}`);
+    log(`using loopback ports broker=${brokerPort.port}, vaultwarden=${vaultwardenPort.port}`);
     log("generating throwaway TLS cert (bw refuses plain-http vaults)");
     await generateSmokeTls();
     const vwFetch = fetchWithCa(CA_FILE);
 
     log("starting vaultwarden");
-    await runOrDie([...COMPOSE, "up", "-d", "vaultwarden"], { env: composeEnv });
+    vaultwardenPort.release();
     composeUp = true;
-    await waitForHttp(`${VW_URL}/alive`, 60_000, vwFetch);
+    await runOrDie([...COMPOSE, "up", "-d", "vaultwarden"], { env: composeEnv });
+    await waitForHttp(`${vaultwardenUrl}/alive`, 60_000, vwFetch);
 
     log("bootstrapping vaultwarden account + item");
-    await registerVaultwardenAccount(VW_URL, EMAIL, MASTER_PASSWORD, { fetchImpl: vwFetch });
-    const apiKey = await obtainUserApiKey(VW_URL, EMAIL, MASTER_PASSWORD, { fetchImpl: vwFetch });
+    await registerVaultwardenAccount(vaultwardenUrl, EMAIL, MASTER_PASSWORD, { fetchImpl: vwFetch });
+    const apiKey = await obtainUserApiKey(vaultwardenUrl, EMAIL, MASTER_PASSWORD, { fetchImpl: vwFetch });
     await createLoginItemWithBw({
       bwPath: BW_PATH,
-      baseUrl: VW_URL,
+      baseUrl: vaultwardenUrl,
       email: EMAIL,
       password: MASTER_PASSWORD,
       itemName: ITEM_NAME,
@@ -144,9 +172,10 @@ async function main() {
     writeFileSync(join(DEPLOY, "secrets", "bw_clientsecret"), apiKey.client_secret, { mode: 0o600 });
 
     log("building + starting broker");
+    brokerPort.release();
     await runOrDie([...COMPOSE, "up", "-d", "--build", "broker"], { env: composeEnv });
     try {
-      await waitForHttp(`${BROKER_URL}/healthz`, 120_000);
+      await waitForHttp(`${brokerUrl}/healthz`, 120_000);
     } catch (error) {
       const logs = await run([...COMPOSE, "logs", "--no-color", "broker"], { env: composeEnv });
       throw new Error(`${error instanceof Error ? error.message : String(error)}\nbroker logs:\n${logs.stdout}\n${logs.stderr}`);
@@ -157,8 +186,9 @@ async function main() {
       ...COMPOSE, "exec", "-T", "broker",
       "bun", "run", "server/src/cli_admin.ts", "client", "add", "smoke-agent",
     ], { env: composeEnv });
+    const clientId = added.stdout.match(/client_id:\s+(\S+)/)?.[1];
     const token = added.stdout.match(/token:\s+(\S+)/)?.[1];
-    if (!token) throw new Error(`could not parse token from: ${added.stdout}`);
+    if (!clientId || !token) throw new Error("could not parse client identity from client add output");
 
     log("building the CLI binary");
     await runOrDie(["bash", join(REPO_ROOT, "cli", "build.sh")]);
@@ -167,7 +197,11 @@ async function main() {
     const probe = join(scratch, "probe.sh");
     writeFileSync(probe, "#!/bin/sh\nprintf '%s' \"$SMOKE_TOKEN\"\n", { mode: 0o755 });
 
-    const cliEnv = { SECRETARY_URL: BROKER_URL, SECRETARY_TOKEN: token };
+    const cliEnv = {
+      SECRETARY_URL: brokerUrl,
+      SECRETARY_TOKEN: token,
+      SECRETARY_CLIENT_ID: clientId,
+    };
     const cliArgv = [
       join(REPO_ROOT, "cli", "scripts", "secretary"),
       "exec", "--reason", "end-to-end smoke test of the secretary broker",
@@ -192,7 +226,7 @@ async function main() {
     if (second.stdout !== SECRET_VALUE) {
       throw new Error(`second exec child env mismatch: got ${JSON.stringify(second.stdout)}`);
     }
-    if (!second.stderr.includes("已复用")) {
+    if (!second.stderr.includes("命中已有授权")) {
       throw new Error(`second exec did not report grant reuse; stderr: ${second.stderr}`);
     }
 
@@ -202,22 +236,22 @@ async function main() {
     log(`  exec #2 (fast path):          ${secondMs} ms`);
     log(`  total wall clock:             ${Date.now() - started} ms`);
   } finally {
+    vaultwardenPort.release();
+    brokerPort.release();
     if (process.env.SMOKE_KEEP === "1") {
       // No `return` here: returning from a finally block would swallow a
       // pending test failure. Just skip the cleanup.
       log("SMOKE_KEEP=1 — leaving the compose stack and secret files in place for debugging");
     } else {
-      await cleanup(composeUp, scratch);
+      await cleanup(composeUp, scratch, composeEnv);
     }
   }
 }
 
-async function cleanup(composeUp: boolean, scratch: string): Promise<void> {
+async function cleanup(composeUp: boolean, scratch: string, composeEnv: Record<string, string>): Promise<void> {
   if (composeUp) {
     log("tearing down compose project");
-    await run([...COMPOSE, "down", "-v"], {
-      env: { BW_EMAIL: EMAIL, TELEGRAM_CHAT_ID: "0", TELEGRAM_ALLOWED_USER_IDS: "1" },
-    });
+    await run([...COMPOSE, "down", "-v"], { env: composeEnv });
   }
   for (const name of ["bw_clientid", "bw_clientsecret", "bw_password", "telegram_bot_token"]) {
     rmSync(join(DEPLOY, "secrets", name), { force: true });
