@@ -20,8 +20,11 @@ opens an interactive picker you have no terminal to answer — and see the
 yourself.
 
 Then the user points it at their broker: `auth set-url <their broker URL>` and
-`auth import` (the token comes from `client add` on the broker host). Those two
-steps are theirs — never ask for, accept, or echo the token.
+`auth import`. On macOS the token is saved in Keychain. On Linux, it is read twice
+without echo and saved in `${XDG_CONFIG_HOME:-$HOME/.config}/secretary/config.json`
+with a `0700` directory and `0600` file. Environment variables always override
+platform storage. Those bootstrap steps are theirs — never ask for, accept, or
+echo the token.
 
 Credentials live in a Bitwarden/Vaultwarden vault. The `approved-secret` command talks
 to the secretary broker, which is the only thing that ever holds plaintext. You can:

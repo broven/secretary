@@ -168,10 +168,15 @@ agent's conversation:
 ```sh
 approved-secret auth set-url https://secretary.example.com
 approved-secret auth set-client-id <client_id>
-approved-secret auth import     # prompts for the token → macOS Keychain
+approved-secret auth import     # prompts twice without echo → macOS Keychain
 ```
 
-On Linux, `SECRETARY_URL` / `SECRETARY_TOKEN` env vars replace the Keychain.
+On Linux, the same commands store `url`, `token` and optional `clientId` in
+`${XDG_CONFIG_HOME:-$HOME/.config}/secretary/config.json` (directory `0700`,
+file `0600`). `auth import` reads the token twice without echoing it. Environment
+variables `SECRETARY_URL`, `SECRETARY_TOKEN` and `SECRETARY_CLIENT_ID` always
+override the stored values; `auth delete` removes only the platform config and
+never unsets environment variables.
 
 ### 3. Use it
 
@@ -195,6 +200,9 @@ official Bitwarden and Vaultwarden (anything the `bw` CLI accepts — the
 broker requires an https vault URL).
 
 ## Development
+
+Contributor setup and the complete local task loop are documented in
+[ONBOARD.md](./ONBOARD.md). The underlying commands are:
 
 ```sh
 bun test                                   # unit + integration (fake vault/Telegram)
