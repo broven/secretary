@@ -1073,8 +1073,8 @@ async function validateApprovalResult(
     throw new Error("secretary 未返回本次申请的完整凭证");
   }
   const expiry = Date.parse(result.expires_at || "");
-  // 最长档位是 7 天；多给 10 分钟容忍时钟偏移。
-  if (!Number.isFinite(expiry) || expiry <= now || expiry > now + 7 * 24 * 60 * 60 * 1000 + 10 * 60 * 1000 || !result.lease_id) {
+  // 最长档位是 30 天；多给 10 分钟容忍时钟偏移。
+  if (!Number.isFinite(expiry) || expiry <= now || expiry > now + 30 * 24 * 60 * 60 * 1000 + 10 * 60 * 1000 || !result.lease_id) {
     throw new Error("secretary 返回的授权有效期无效");
   }
   return { ...result, credentials };

@@ -59,7 +59,7 @@ stays the source of truth), Windows support for the CLI (macOS/Linux first).
 3. **Fast path**: all pairs granted → encrypt Envelope, respond on the same
    connection. First-seen argv additionally fires a non-blocking Sighting
    notification with a revoke button.
-4. **Approval path**: broker sends the Telegram card (approve 1h/8h/7d, reject),
+4. **Approval path**: broker sends the Telegram card (approve 1h/8h/7d/30d, reject),
    parks the request in memory, and resolves it when the button callback arrives
    via getUpdates. First decision wins; the window (`APPROVAL_TIMEOUT_S`,
    default 1500 s) fails closed. The window is split into `APPROVAL_CARDS`
@@ -141,7 +141,7 @@ Ported unchanged from the predecessor:
 - **Environment scrubbing**: the CLI wrapper starts from `env -i`, passes an
   allowlist, restores the caller's `PATH` for the child; reserved env prefixes are
   rejected as aliases.
-- **Grant model**: containment matching, TTLs of 1h/8h/7d, `GREATEST` semantics on
+- **Grant model**: containment matching, TTLs of 1h/8h/7d/30d, `GREATEST` semantics on
   extension, no command in the key (Sightings cover that, non-blocking).
 - **Inline shell**: always approve, never grant.
 - **Fail closed**: timeout or any ambiguity → no secrets.

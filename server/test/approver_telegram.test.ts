@@ -112,7 +112,7 @@ function keyboardButtons(index: number): Array<{ text: string; callback_data: st
   return (fake.sentMessages[index].reply_markup?.inline_keyboard ?? []).flat();
 }
 
-test("renders the approval card with escaped command, item name, and 4 buttons", async () => {
+test("renders the approval card with escaped command, item name, and 5 buttons", async () => {
   const card = makeCard();
   const decision = approver.requestApproval(card, 5000);
   await waitFor(() => fake.sentMessages.length === 1);
@@ -125,11 +125,12 @@ test("renders the approval card with escaped command, item name, and 4 buttons",
   expect(message.text).toContain("password → REGISTRY_TOKEN");
 
   const buttons = keyboardButtons(0);
-  expect(buttons.length).toBe(4);
+  expect(buttons.length).toBe(5);
   expect(buttons.map((button) => button.callback_data)).toEqual([
     `ap:${card.id}:approve_1h`,
     `ap:${card.id}:approve_8h`,
     `ap:${card.id}:approve_7d`,
+    `ap:${card.id}:approve_30d`,
     `ap:${card.id}:deny`,
   ]);
   expect(buttons.map((button) => button.text).join(" ")).toContain("批准 1 小时");
@@ -170,6 +171,19 @@ test("approve_8h from an allowed user resolves approved with ttl 8h", async () =
   }
   // The keyboard is removed after the decision.
   await waitFor(() => fake.editedMarkups.length === 1);
+});
+
+test("approve_30d from an allowed user resolves approved with ttl 30d", async () => {
+  const card = makeCard();
+  const decision = approver.requestApproval(card, 5000);
+  await waitFor(() => fake.sentMessages.length === 1);
+
+  fake.pressButton(`ap:${card.id}:approve_30d`, ALLOWED_USER);
+  await expect(decision).resolves.toMatchObject({
+    approved: true,
+    ttl: "30d",
+    decided_by: String(ALLOWED_USER),
+  });
 });
 
 test("first decision wins: a later deny does not override approve_1h", async () => {

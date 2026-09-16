@@ -88,10 +88,11 @@ describe("GrantStore", () => {
   });
 
   describe("TTL", () => {
-    const cases: Array<["1h" | "8h" | "7d", number]> = [
+    const cases: Array<["1h" | "8h" | "7d" | "30d", number]> = [
       ["1h", 1],
       ["8h", 8],
       ["7d", 168],
+      ["30d", 720],
     ];
     for (const [ttl, hours] of cases) {
       test(`${ttl} expires at now + ${hours}h`, () => {
@@ -109,6 +110,13 @@ describe("GrantStore", () => {
       // Other columns still take the latest approval's values.
       expect(after.ttl).toBe("1h");
       expect(after.approval_id).toBe("approval_87654321");
+    });
+
+    test("re-saving 7d grant with 30d extends expiry", () => {
+      store.save(identity, [unitA], "7d", APPROVAL_ID);
+      clock.advance(10 * 60 * 1000);
+      const [after] = store.save(identity, [unitA], "30d", "approval_30days");
+      expect(Date.parse(after.expires_at)).toBe(clock.now() + 720 * HOUR_MS);
     });
 
     test("re-saving 1h grant with 8h extends expiry", () => {

@@ -7,11 +7,11 @@ import type { SecretField } from "./vault.ts";
 export type { SecretField };
 
 /** Grant TTL choices; "once" is the inline-shell-only "this run, no grant" pass. */
-export type SecretGrantTtl = "1h" | "8h" | "7d";
+export type SecretGrantTtl = "1h" | "8h" | "7d" | "30d";
 export type ApprovalTtl = SecretGrantTtl | "once";
 
-export const SECRET_GRANT_TTLS: readonly SecretGrantTtl[] = ["1h", "8h", "7d"];
-const TTL_HOURS: Readonly<Record<SecretGrantTtl, number>> = { "1h": 1, "8h": 8, "7d": 168 };
+export const SECRET_GRANT_TTLS: readonly SecretGrantTtl[] = ["1h", "8h", "7d", "30d"];
+const TTL_HOURS: Readonly<Record<SecretGrantTtl, number>> = { "1h": 1, "8h": 8, "7d": 168, "30d": 720 };
 
 export function isSecretGrantTtl(value: unknown): value is SecretGrantTtl {
   return typeof value === "string" && (SECRET_GRANT_TTLS as readonly string[]).includes(value);
