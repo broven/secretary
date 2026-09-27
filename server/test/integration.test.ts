@@ -18,21 +18,23 @@ import { startFakeTelegram, type FakeTelegram } from "./helpers/fake_telegram.ts
 
 const OWNER = 42;
 
+/** Metadata a test does not care about is optional and filled with neutral defaults. */
 type FakeItem =
-  & Omit<ResolvedItem, "created_at">
-  & { created_at?: string; values: Partial<Record<SecretField, string>> };
+  & Omit<ResolvedItem, "created_at" | "how_to_get">
+  & { created_at?: string; how_to_get?: string; values: Partial<Record<SecretField, string>> };
 
 class FakeVault implements Vault {
   syncCount = 0;
   private readonly items: Array<ResolvedItem & { values: Partial<Record<SecretField, string>> }>;
   constructor(items: FakeItem[]) {
-    this.items = items.map((item) => ({ created_at: item.revision, ...item }));
+    this.items = items.map((item) => ({ created_at: item.revision, how_to_get: "", ...item }));
   }
   async catalog(query = "") {
     const normalized = query.trim().toLowerCase();
     return this.items
       .filter((item) => !normalized || item.name.toLowerCase().includes(normalized))
-      .map(({ name, description, fields, created_at }) => ({ name, description, fields, created_at }));
+      .map(({ name, description, fields, created_at, how_to_get }) =>
+        ({ name, description, fields, created_at, how_to_get }));
   }
   // These read-path tests never write; the write surface exists only to satisfy
   // the Vault contract, and is loud if a test reaches it by accident.

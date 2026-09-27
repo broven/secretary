@@ -22,6 +22,7 @@ mise run install
 
 ```sh
 mise run test
+mise run typecheck
 mise run lint
 mise run build
 ```
@@ -46,13 +47,14 @@ stack when it exits.
 | `mise run dev` | List the available development entry points |
 | `mise run dev:broker` | Run the broker from source using the current environment |
 | `mise run test` | Run hermetic unit and integration tests |
+| `mise run typecheck` | Type-check every workspace with `tsc --noEmit` |
 | `mise run lint` | Run ShellCheck and actionlint |
 | `mise run build` | Test and compile the local CLI binary |
 | `mise run smoke` | Run the disposable Docker end-to-end test |
 
 ## Secrets and configuration
 
-The routine install, test, lint, and build tasks require no external secrets.
+The routine install, test, typecheck, lint, and build tasks require no external secrets.
 The smoke test creates throwaway values locally and does not use the owner's
 vault.
 

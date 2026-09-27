@@ -291,6 +291,7 @@ test("a read resolved between destructive revocations cannot save its approved g
         name: "Example API",
         description: "test item",
         fields: [unitA.field],
+        how_to_get: "",
       }];
     },
     async readValues(units: Array<{ item_id: string; field: SecretField }>) {

@@ -168,7 +168,7 @@ function makeDeps(options: MakeDepsOptions = {}) {
         return Response.json(CATALOG_RESPONSE);
       }
       return new Response(JSON.stringify({ error: "not found" }), { status: 404 });
-    }) as typeof fetch,
+    }) as ClientDeps["fetch"],
     keychain,
     realpath: (async () => "/canonical/repo") as ClientDeps["realpath"],
     stat: (async () => ({ isDirectory: () => true })) as never,
@@ -463,7 +463,7 @@ describe("self-contained secretary client", () => {
     const context = makeDeps();
     context.deps.fetch = (async () => {
       throw Object.assign(new Error("aborted"), { name: "TimeoutError" });
-    }) as typeof fetch;
+    }) as ClientDeps["fetch"];
     // Distinct exit code: "not answered yet" must not read as a broken command.
     expect(await main([
       "--cwd", "/repo", "exec", "--reason", "给 CI 补一个 release tag", "--item", "Example API", "password=EXAMPLE_TOKEN", "--", "tool",
@@ -579,7 +579,7 @@ describe("self-contained secretary client", () => {
   test("broker HTTP errors surface the status and server message", async () => {
     const context = makeDeps();
     context.deps.fetch = (async () =>
-      new Response(JSON.stringify({ error: "token revoked" }), { status: 403 })) as typeof fetch;
+      new Response(JSON.stringify({ error: "token revoked" }), { status: 403 })) as ClientDeps["fetch"];
     expect(await main(["--cwd", "/repo", "list"], context.deps)).toBe(1);
     const message = context.stderr.join("");
     expect(message).toContain("HTTP 403");
@@ -592,7 +592,7 @@ describe("self-contained secretary client", () => {
     context.deps.fetch = (async () => {
       calls++;
       throw new TypeError("fetch failed");
-    }) as typeof fetch;
+    }) as ClientDeps["fetch"];
     expect(await main([
       "--cwd", "/repo", "exec", "--reason", "给 CI 补一个 release tag", "--item", "Example API", "password=EXAMPLE_TOKEN", "--", "tool",
     ], context.deps)).toBe(1);
@@ -652,7 +652,7 @@ describe("self-contained secretary client", () => {
     const context = makeDeps();
     context.deps.fetch = (async () => {
       throw new Error("unknown certificate verification error");
-    }) as typeof fetch;
+    }) as ClientDeps["fetch"];
     expect(await main(["--cwd", "/repo", "list", "example"], context.deps)).toBe(1);
     const err = context.stderr.join("");
     expect(err).toContain("broker.example.com");
@@ -758,7 +758,7 @@ describe("review fixes", () => {
       const headers = new Headers(response.headers);
       headers.set("X-Secretary-Approval-Timeout", "600");
       return new Response(response.body, { status: response.status, headers });
-    }) as typeof fetch;
+    }) as ClientDeps["fetch"];
     expect(await main([
       "--cwd", "/repo", "exec", "--reason", "给 CI 补一个 release tag",
       "--item", "Example API", "password=EXAMPLE_TOKEN", "--", "tool",

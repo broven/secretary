@@ -24,6 +24,10 @@ run = "bun run server/src/main.ts"
 description = "Run the complete hermetic unit and integration test suite"
 run = "bun test"
 
+[tasks.typecheck]
+description = "Type-check the CLI, broker, tests, and deploy scripts"
+run = "bun run typecheck"
+
 [tasks.lint]
 description = "Lint shell entrypoints and GitHub Actions workflows"
 run = '''
