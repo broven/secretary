@@ -150,6 +150,10 @@ Ported unchanged from the predecessor:
   (ADR-0009).
 - **Owner overview**: `/grants` in the Approver chat lists live Grants per
   Approval with one-tap revoke (all, or only the inline permission).
+- **Only asks ring**: an Approver message rings the Owner's phone only when a tap
+  is needed before something can proceed (approval and write-approval cards).
+  Every informational message — Sightings, write records, give-up notices, the
+  `/grants` listing — is sent silently (ADR-0009).
 - **Fail closed**: timeout or any ambiguity → no secrets.
 - **Write path**: every write is approved and creates no Grant; values reach the Owner
   only as Fingerprints; `bw delete --permanent` is never reachable. Its transport

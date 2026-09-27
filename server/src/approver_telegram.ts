@@ -697,6 +697,7 @@ export class TelegramApprover implements Approver {
     for (let index = 0; index < texts.length; index++) {
       const first = index === 0;
       const last = index === texts.length - 1;
+      // Rings (no disable_notification): the Request waits on a tap.
       const message = await this.api<{ message_id?: unknown }>("sendMessage", {
         chat_id: this.chatId,
         text: first && round > 1 ? `${REPUSH_PREFIX(round)}\n${texts[index]}` : texts[index],
@@ -749,8 +750,8 @@ export class TelegramApprover implements Approver {
         message_id: last,
         reply_markup: { inline_keyboard: [] },
       });
-      await this.api("sendMessage", {
-        chat_id: this.chatId,
+      // Nothing can be tapped any more, so this record must not ring.
+      await this.sendInformational({
         text: GAVE_UP_TEXT,
         parse_mode: "HTML",
         disable_web_page_preview: true,
@@ -801,6 +802,7 @@ export class TelegramApprover implements Approver {
     try {
       const texts = buildWriteMessages(card);
       for (let index = 0; index < texts.length; index++) {
+        // Rings (no disable_notification): the write waits on a tap.
         await this.api("sendMessage", {
           chat_id: this.chatId,
           text: texts[index],
@@ -822,8 +824,7 @@ export class TelegramApprover implements Approver {
 
   async notifyWrite(note: WriteNote): Promise<void> {
     try {
-      await this.api("sendMessage", {
-        chat_id: this.chatId,
+      await this.sendInformational({
         text: buildWriteNoteText(note),
         parse_mode: "HTML",
         disable_web_page_preview: true,
@@ -840,16 +841,12 @@ export class TelegramApprover implements Approver {
       // mapping lives in the durable store behind hooks.onRevoke, so the
       // button survives broker restarts.
       //
-      // Silent: nothing waits on a Sighting. Only cards that need a tap to
-      // proceed may ring, or the ones that do get drowned out.
       const texts = buildSightingMessages(card);
       for (let index = 0; index < texts.length; index++) {
-        await this.api("sendMessage", {
-          chat_id: this.chatId,
+        await this.sendInformational({
           text: texts[index],
           parse_mode: "HTML",
           disable_web_page_preview: true,
-          disable_notification: true,
           ...(index === texts.length - 1 ? { reply_markup: buildSightingKeyboard(card) } : {}),
         });
       }
@@ -916,11 +913,9 @@ export class TelegramApprover implements Approver {
     if (!this.hooks.listGrants) return;
     try {
       const view = buildGrantsPage(await this.hooks.listGrants(), 0);
-      await this.api("sendMessage", {
-        chat_id: this.chatId,
+      await this.sendInformational({
         text: view.text,
         disable_web_page_preview: true,
-        disable_notification: true,
         reply_markup: view.reply_markup,
       });
     } catch (error) {
@@ -1091,6 +1086,18 @@ export class TelegramApprover implements Approver {
   }
 
   // -- Telegram API helpers -------------------------------------------------
+
+  /**
+   * Send a message that asks nothing of the Owner. The rule: only messages
+   * that need a tap before something can proceed (approval and write-approval
+   * cards) may ring the phone; everything else — Sightings, write records,
+   * give-up notices, /grants — is sent silently, so the ones that ring are
+   * never drowned out. Sending informational messages only through here keeps
+   * that rule in one place.
+   */
+  private sendInformational(body: Record<string, unknown>): Promise<unknown> {
+    return this.api("sendMessage", { ...body, chat_id: this.chatId, disable_notification: true });
+  }
 
   private async api<T = unknown>(method: string, body: unknown, signal?: AbortSignal): Promise<T> {
     // The URL contains the bot token — it must never appear in errors or logs.

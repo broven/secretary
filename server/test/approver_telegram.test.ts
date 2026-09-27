@@ -322,6 +322,8 @@ test("approving a write says it is approved, not already applied", async () => {
   const card = makeWriteCard();
   const decision = approver.requestWriteApproval(card, 5000);
   await waitFor(() => fake.sentMessages.length === 1);
+  // A write approval waits on a tap, so it rings.
+  expect(fake.sentMessages[0].disable_notification).toBeUndefined();
 
   fake.pressButton(keyboardButtons(0)[0].callback_data, ALLOWED_USER);
   await expect(decision).resolves.toMatchObject({ approved: true });
@@ -517,6 +519,11 @@ test("the abandoned window leaves a record instead of an empty chat", async () =
     await waitFor(() => fake.sentMessages.some((message) => message.text.includes("已放弃")), 2000);
     // The dead card's buttons are stripped so a late tap cannot look live.
     expect(fake.editedMarkups.length).toBeGreaterThan(0);
+    // Nothing is left to tap, so the record must not ring; the cards did.
+    const gaveUp = fake.sentMessages.find((message) => message.text.includes("已放弃"))!;
+    expect(gaveUp.disable_notification).toBe(true);
+    const cards = fake.sentMessages.filter((message) => message !== gaveUp);
+    expect(cards.every((message) => message.disable_notification === undefined)).toBe(true);
   } finally {
     repusher.stop();
   }
@@ -682,4 +689,18 @@ test("a full page of worst-case entries fits one message and every callback fits
   const callbacks = view.reply_markup.inline_keyboard.flat().map((button) => button.callback_data);
   expect(callbacks).toHaveLength(GRANTS_PAGE_SIZE * 2 + 1);
   for (const data of callbacks) expect(new TextEncoder().encode(data).length).toBeLessThanOrEqual(64);
+});
+
+test("a write record is sent silently: it asks nothing of the Owner", async () => {
+  await approver.notifyWrite({
+    id: crypto.randomUUID(),
+    headline: "录入完成：Registry Token",
+    lines: [{ label: "字段", value: "password" }],
+    repo: "acme/site",
+    host: "buildbox",
+    user: "randy",
+    client_name: "client-abc",
+  });
+  expect(fake.sentMessages).toHaveLength(1);
+  expect(fake.sentMessages[0].disable_notification).toBe(true);
 });

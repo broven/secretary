@@ -56,7 +56,9 @@ is never silent about what was missed (ADR-0006).
 
 The channel interface through which the Owner receives Approvals and revocations.
 It also carries notifications the Owner cannot answer — Sightings, and the record
-of a completed Write Request — so that nothing changes the vault silently.
+of a completed Write Request — so that nothing changes the vault silently. Only
+messages that need a tap to proceed ring the phone; notifications arrive without
+a sound, but they arrive.
 Telegram is the first implementation. One Broker uses one Approver at a time.
 
 ## Grant

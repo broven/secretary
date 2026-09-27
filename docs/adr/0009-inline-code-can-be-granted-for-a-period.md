@@ -44,8 +44,12 @@ can never quietly extend what inline code may do.
 
 Two things make the wider permission tolerable to live with:
 
-- **Silent Sightings with the code on them.** Every Sighting is sent with
-  `disable_notification`; only cards that need a tap to proceed ring. An inline
+- **Silent Sightings with the code on them.** The Approver follows one rule for
+  every message: only a message that needs a tap before something can proceed
+  — an approval card or a write-approval card — rings the phone. Everything
+  informational is sent with `disable_notification`: Sightings, write records,
+  the give-up notice on an abandoned card, the `/grants` listing. A Sighting
+  that rang would train the Owner to ignore the ones that matter. An inline
   Sighting renders the complete code, since the Owner never saw this run's code
   on any card. When the Grant carries inline permission the Sighting offers
   "只撤内联权限" beside "全部吊销".
