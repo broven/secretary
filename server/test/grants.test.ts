@@ -4,8 +4,10 @@ import {
   assertSecretGrantKey,
   commandFingerprint,
   commandSightingKey,
+  grantCoverageExpiry,
   GrantRevokedDuringApprovalError,
   GrantStore,
+  listGrantEntries,
   type SecretGrantIdentity,
   secretGrantKey,
 } from "../src/grants.ts";
@@ -473,5 +475,172 @@ describe("durable revoke handles (P1-c)", () => {
     expect(() => store.saveRevokeHandle("bad handle", [key])).toThrow("invalid revoke handle");
     expect(() => store.saveRevokeHandle("11111111-2222-4333-8444-555555555555", [])).toThrow();
     expect(() => store.saveRevokeHandle("11111111-2222-4333-8444-555555555555", ["nothex"])).toThrow();
+  });
+});
+
+describe("inline permission (ADR-0009)", () => {
+  const keyA = secretGrantKey(identity, unitA);
+  const keyB = secretGrantKey(identity, unitB);
+
+  /** Until when the stored row for `key` covers a Request of this kind, or null. */
+  function covers(store: GrantStore, key: string, inline: boolean, nowMs: number): number | null {
+    const grant = store.findActive([key]).get(key);
+    const until = grant ? grantCoverageExpiry(grant, inline, nowMs) : null;
+    return until === null ? null : Date.parse(until);
+  }
+
+  test("coverage matrix: inline needs inline permission; ordinary takes either", () => {
+    const { store, clock } = makeStore();
+    const t0 = clock.now();
+    store.save(identity, [unitA], "8h", APPROVAL_ID);
+    store.save(identity, [unitB], "1h", APPROVAL_ID, undefined, undefined, undefined, { inline: true });
+
+    // Ordinary-only row: covers ordinary commands, never inline code.
+    expect(covers(store, keyA, false, t0)).toBe(t0 + 8 * HOUR_MS);
+    expect(covers(store, keyA, true, t0)).toBeNull();
+    // Inline-only row: covers both, since inline ⊇ ordinary.
+    expect(covers(store, keyB, true, t0)).toBe(t0 + HOUR_MS);
+    expect(covers(store, keyB, false, t0)).toBe(t0 + HOUR_MS);
+  });
+
+  test("an ordinary approval extends only expires_at; an inline one only inline_expires_at", () => {
+    const { store, clock } = makeStore();
+    const t0 = clock.now();
+    store.save(identity, [unitA], "7d", APPROVAL_ID, undefined, undefined, undefined, { inline: true });
+    const [afterOrdinary] = store.save(identity, [unitA], "1h", "approval_ordinary1");
+    // The shorter ordinary approval neither shortens nor touches the inline expiry.
+    expect(Date.parse(afterOrdinary.inline_expires_at!)).toBe(t0 + 168 * HOUR_MS);
+    expect(Date.parse(afterOrdinary.expires_at)).toBe(t0 + HOUR_MS);
+
+    const [afterInline] = store.save(identity, [unitA], "8h", "approval_inline22", undefined, undefined, undefined, {
+      inline: true,
+    });
+    // A shorter inline approval cannot shrink either expiry (MAX), and does
+    // not stretch the ordinary one to its own length.
+    expect(Date.parse(afterInline.inline_expires_at!)).toBe(t0 + 168 * HOUR_MS);
+    expect(Date.parse(afterInline.expires_at)).toBe(t0 + HOUR_MS);
+
+    store.save(identity, [unitA], "30d", "approval_inline33", undefined, undefined, undefined, { inline: true });
+    expect(covers(store, keyA, true, t0)).toBe(t0 + 720 * HOUR_MS);
+  });
+
+  test("the two expiries run out independently", () => {
+    const { store, clock, db } = makeStore();
+    const t0 = clock.now();
+    store.save(identity, [unitA], "8h", APPROVAL_ID, undefined, undefined, undefined, { inline: true });
+    store.save(identity, [unitA], "30d", "approval_ordinary1");
+
+    clock.advance(9 * HOUR_MS);
+    store.sweep();
+    // Inline ran out; the longer ordinary permission is still there.
+    expect(covers(store, keyA, true, clock.now())).toBeNull();
+    expect(covers(store, keyA, false, clock.now())).toBe(t0 + 720 * HOUR_MS);
+
+    // And the reverse: an inline-only row outlives its (absent) ordinary expiry
+    // through the sweep, then goes once inline runs out.
+    store.save(identity, [unitB], "1h", "approval_inline44", undefined, undefined, undefined, { inline: true });
+    clock.advance(30 * 60 * 1000);
+    store.sweep();
+    expect(covers(store, keyB, false, clock.now())).not.toBeNull();
+    clock.advance(31 * 60 * 1000);
+    store.sweep();
+    const rows = db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM secret_grants WHERE grant_key = ?")
+      .get(keyB);
+    expect(rows?.n).toBe(0);
+  });
+
+  test("revoking inline keeps ordinary permission and drops rows left with nothing", () => {
+    const { store, clock } = makeStore();
+    store.save(identity, [unitA], "8h", APPROVAL_ID);
+    store.save(identity, [unitA, unitB], "7d", "approval_inline55", undefined, undefined, undefined, { inline: true });
+
+    expect(store.revokeInline([keyA, keyB])).toBe(2);
+    expect(covers(store, keyA, true, clock.now())).toBeNull();
+    expect(covers(store, keyA, false, clock.now())).toBe(clock.now() + 8 * HOUR_MS);
+    // B only ever had inline permission: nothing left, nothing listed.
+    expect(store.findActive([keyB]).size).toBe(0);
+    expect(store.revokeInline([keyA])).toBe(0);
+  });
+
+  test("inline revoke handles resolve durably, like full ones", () => {
+    const { store, clock } = makeStore();
+    store.save(identity, [unitA], "8h", APPROVAL_ID, undefined, undefined, undefined, { inline: true });
+    store.save(identity, [unitA], "1h", "approval_ordinary1");
+    const handle = "11111111-2222-4333-8444-555555555555";
+    store.saveRevokeHandle(handle, [keyA]);
+    expect(store.revokeInlineByHandle(handle)).toBe(1);
+    expect(covers(store, keyA, false, clock.now())).toBe(clock.now() + HOUR_MS);
+    expect(store.revokeInlineByHandle("99999999-2222-4333-8444-555555555555")).toBeNull();
+  });
+
+  test("a database from before inline grants gains the column and keeps its rows", () => {
+    const db = new Database(":memory:");
+    const nowMs = 1_700_000_000_000;
+    // The v0.4 schema, verbatim, with one live grant in it.
+    db.run(`CREATE TABLE secret_grants (
+      grant_key TEXT PRIMARY KEY, caller_id TEXT NOT NULL, client_id TEXT NOT NULL,
+      repo TEXT NOT NULL, item_id TEXT NOT NULL, field TEXT NOT NULL, ttl TEXT NOT NULL,
+      approval_id TEXT NOT NULL, decided_by TEXT, decided_at TEXT,
+      expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`);
+    db.run(
+      `INSERT INTO secret_grants VALUES (?, ?, ?, ?, ?, ?, '8h', ?, NULL, NULL, ?, ?, ?)`,
+      [keyA, identity.caller_id, identity.client_id, identity.repo, unitA.item_id, unitA.field, APPROVAL_ID,
+        nowMs + HOUR_MS, nowMs, nowMs],
+    );
+    const store = new GrantStore(db, () => nowMs);
+    const grant = store.findActive([keyA]).get(keyA)!;
+    expect(grant.inline_expires_at).toBeUndefined();
+    expect(grantCoverageExpiry(grant, false, nowMs)).not.toBeNull();
+    expect(grantCoverageExpiry(grant, true, nowMs)).toBeNull();
+    // Idempotent: a second boot does not try to add the column again.
+    expect(() => new GrantStore(db, () => nowMs)).not.toThrow();
+  });
+});
+
+describe("grant listing", () => {
+  test("one entry per approval, earliest expiry first, with names resolved best effort", async () => {
+    const { store, clock } = makeStore();
+    const t0 = clock.now();
+    store.save(identity, [unitA, unitAUsername], "7d", "approval_week0001");
+    store.save(identity, [unitB], "1h", "approval_hour0001", undefined, undefined, undefined, { inline: true });
+    store.save({ ...identity, repo: "github.com/acme/other" }, [unitC], "30d", "approval_month001");
+
+    const entries = await listGrantEntries(store, async () => new Map([[unitA.item_id, "Alpha API"]]));
+    expect(entries.map((entry) => entry.approval_id))
+      .toEqual(["approval_hour0001", "approval_week0001", "approval_month001"]);
+    expect(entries[0]).toMatchObject({
+      repo: identity.repo,
+      client_name: identity.caller_id,
+      // Unknown to the vault: the id stands in rather than hiding the grant.
+      items: [{ name: unitB.item_id, fields: ["username"] }],
+      inline_expires_at: new Date(t0 + HOUR_MS).toISOString(),
+    });
+    expect(entries[0].expires_at).toBeUndefined();
+    expect(entries[1].items).toEqual([{ name: "Alpha API", fields: ["password", "username"] }]);
+    expect(entries[1].inline_expires_at).toBeUndefined();
+    expect(entries[2].repo).toBe("github.com/acme/other");
+
+    // A vault that cannot answer still yields the listing.
+    const offline = await listGrantEntries(store, async () => {
+      throw new Error("vault down");
+    });
+    expect(offline[1].items[0].name).toBe(unitA.item_id);
+  });
+
+  test("revoking by approval removes exactly what that approval holds", async () => {
+    const { store } = makeStore();
+    store.save(identity, [unitA, unitB], "8h", "approval_first001");
+    store.save(identity, [unitC], "8h", "approval_second01", undefined, undefined, undefined, { inline: true });
+    store.save(identity, [unitC], "1h", "approval_third001");
+
+    expect(store.revokeApproval("approval_first001")).toBe(2);
+    // unitC's row now belongs to the last approval that touched it.
+    expect(store.revokeApprovalInline("approval_second01")).toBe(0);
+    expect(store.revokeApprovalInline("approval_third001")).toBe(1);
+    const entries = await listGrantEntries(store);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].approval_id).toBe("approval_third001");
+    expect(entries[0].inline_expires_at).toBeUndefined();
+    expect(store.revokeApproval("not valid!")).toBe(0);
   });
 });

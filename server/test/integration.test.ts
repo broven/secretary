@@ -6,7 +6,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { ClientRegistry } from "../src/clients.ts";
 import { decryptCredentialEnvelope } from "../src/envelope.ts";
-import { GrantStore } from "../src/grants.ts";
+import { GrantStore, listGrantEntries } from "../src/grants.ts";
 import { startHttpServer } from "../src/http.ts";
 import { RequestBroker } from "../src/requests.ts";
 import { TelegramApprover } from "../src/approver_telegram.ts";
@@ -50,6 +50,9 @@ class FakeVault implements Vault {
   }
   async resolveByName(names: string[]) {
     return resolveNamesAgainstCatalog(names, this.items);
+  }
+  async itemNames() {
+    return new Map(this.items.map((item) => [item.item_id, item.name]));
   }
   async readValues(units: Array<{ item_id: string; field: SecretField }>) {
     this.syncCount++;
@@ -105,7 +108,14 @@ async function startStack(options: { approvalTimeoutMs?: number } = {}): Promise
   const telegram = await startFakeTelegram();
   const approver = new TelegramApprover(
     { botToken: "test-bot-token", chatId: "100", allowedUserIds: [OWNER], apiBase: telegram.url },
-    { onRevoke: (sightingId) => grants.revokeByHandle(sightingId) },
+    // Wired as main.ts wires it.
+    {
+      onRevoke: (sightingId) => grants.revokeByHandle(sightingId),
+      onRevokeInline: (sightingId) => grants.revokeInlineByHandle(sightingId),
+      listGrants: () => listGrantEntries(grants, () => vault.itemNames()),
+      revokeApproval: (approvalId, scope) =>
+        scope === "inline" ? grants.revokeApprovalInline(approvalId) : grants.revokeApproval(approvalId),
+    },
     { log: () => {} },
   );
   approver.start();
@@ -324,19 +334,12 @@ describe("broker integration (fake telegram + fake vault)", () => {
     expect(result).toEqual({ approved: false, denied_reason: "timeout" });
   }, 15_000);
 
-  test("inline shell always approves, never writes a grant", async () => {
+  test("inline shell approved once writes no grant", async () => {
     const stack = await startStack();
     const keys = await clientKeys();
     const body = requestBody({ command_argv: ["sh", "-c", "echo $EXAMPLE_TOKEN | tool"] }, keys.publicKeyJwk);
     const pending = postRequest(stack, body);
     await waitForMessages(stack.telegram, 1);
-    // Inline shell card offers only once + deny.
-    const markup = stack.telegram.sentMessages[0].reply_markup as {
-      inline_keyboard: Array<Array<{ callback_data: string }>>;
-    };
-    const keysOffered = markup.inline_keyboard.flat().map((button) => button.callback_data.split(":").pop());
-    expect(keysOffered).toContain("approve_once");
-    expect(keysOffered).not.toContain("approve_8h");
     stack.telegram.pressButton(firstCallback(stack.telegram, 0, ":approve_once"), OWNER);
     const { body: result } = await pending;
     expect(result.approved).toBe(true);
@@ -351,6 +354,89 @@ describe("broker integration (fake telegram + fake vault)", () => {
     stack.telegram.pressButton(firstCallback(stack.telegram, 1, ":deny"), OWNER);
     expect((await pending2).body.approved).toBe(false);
   }, 15_000);
+
+  test("inline approved for a period: fast path for any inline code, silent sighting, inline-only revoke", async () => {
+    const stack = await startStack();
+    const inlineBody = async (code: string) =>
+      requestBody({ command_argv: ["sh", "-c", code] }, (await clientKeys()).publicKeyJwk);
+
+    // An ordinary grant does not cover inline code.
+    const ordinary = postRequest(stack, requestBody({}, (await clientKeys()).publicKeyJwk));
+    await waitForMessages(stack.telegram, 1);
+    stack.telegram.pressButton(firstCallback(stack.telegram, 0, ":approve_1h"), OWNER);
+    expect((await ordinary).body.ttl).toBe("1h");
+    const first = postRequest(stack, await inlineBody("tool --one"));
+    await waitForMessages(stack.telegram, 2);
+    stack.telegram.pressButton(firstCallback(stack.telegram, 1, ":approve_8h"), OWNER);
+    const approved = (await first).body;
+    expect(approved).toMatchObject({ approved: true, ttl: "8h" });
+    expect(approved.grant_reused).toBeUndefined();
+
+    // Different inline code: fast path, and a silent Sighting carrying the code.
+    const keys = await clientKeys();
+    const second = requestBody({ command_argv: ["sh", "-c", "tool --two"] }, keys.publicKeyJwk);
+    const reused = await postRequest(stack, second);
+    expect(reused.body).toMatchObject({ approved: true, grant_reused: true });
+    expect(await decryptCredentialEnvelope(reused.body.credential_envelope, keys.privateKey, second.request_id as string))
+      .toEqual({ EXAMPLE_TOKEN: "example-secret-value" });
+    // Effective expiry is the inline one (8h), not the 1h ordinary one.
+    expect(Date.parse(reused.body.expires_at) - Date.now()).toBeGreaterThan(7 * 60 * 60 * 1000);
+    await waitForMessages(stack.telegram, 3);
+    const sighting = stack.telegram.sentMessages[2];
+    expect(sighting.disable_notification).toBe(true);
+    expect(sighting.text).toContain("tool --two");
+    expect(sighting.text).toContain("内联代码免审复用");
+    // Approval cards, by contrast, ring.
+    expect(stack.telegram.sentMessages[1].disable_notification).toBeUndefined();
+
+    // Revoke only the inline permission: inline asks again, ordinary still flies.
+    const answered = stack.telegram.answeredCallbacks.length;
+    stack.telegram.pressButton(firstCallback(stack.telegram, 2, "ri:"), OWNER);
+    const deadline = Date.now() + 3_000;
+    while (stack.telegram.answeredCallbacks.length <= answered) {
+      if (Date.now() > deadline) throw new Error("inline revoke was never processed");
+      await Bun.sleep(20);
+    }
+    expect(stack.telegram.answeredCallbacks.at(-1)!.text).toBe("已撤销 1 行的内联权限");
+    const ordinaryAgain = await postRequest(stack, requestBody(
+      { command_argv: ["deploy-tool", "--push"] },
+      (await clientKeys()).publicKeyJwk,
+    ));
+    expect(ordinaryAgain.body.grant_reused).toBe(true);
+    const third = postRequest(stack, await inlineBody("tool --three"));
+    await waitForMessages(stack.telegram, 4);
+    stack.telegram.pressButton(firstCallback(stack.telegram, 3, ":deny"), OWNER);
+    expect((await third).body).toEqual({ approved: false, denied_reason: "denied" });
+  }, 20_000);
+
+  test("/grants lists live approvals by item name and revokes from the listing", async () => {
+    const stack = await startStack();
+    const pending = postRequest(stack, requestBody({
+      command_argv: ["sh", "-c", "tool"],
+      items: [
+        { name: "Example API", bindings: [{ field: "password", env: "A_TOKEN" }, { field: "username", env: "A_USER" }] },
+      ],
+    }, (await clientKeys()).publicKeyJwk));
+    await waitForMessages(stack.telegram, 1);
+    stack.telegram.pressButton(firstCallback(stack.telegram, 0, ":approve_7d"), OWNER);
+    expect((await pending).body.approved).toBe(true);
+
+    stack.telegram.sendText("/grants", OWNER, "100");
+    await waitForMessages(stack.telegram, 2);
+    const listing = stack.telegram.sentMessages[1];
+    expect(listing.text).toContain("Example API（password、username）");
+    expect(listing.text).toContain("内联到期");
+    expect(listing.text).toContain("test-agent");
+
+    stack.telegram.pressButton(firstCallback(stack.telegram, 1, "ga:"), OWNER, listing.message_id);
+    const deadline = Date.now() + 3_000;
+    while (stack.telegram.editedTexts.length === 0) {
+      if (Date.now() > deadline) throw new Error("listing was never refreshed");
+      await Bun.sleep(20);
+    }
+    expect(stack.telegram.editedTexts[0].text).toBe("当前没有生效中的授权。");
+    expect(await listGrantEntries(stack.grants)).toEqual([]);
+  }, 20_000);
 
   test("auth and validation: bad token 401, unknown item 400-ish error, reserved env rejected", async () => {
     const stack = await startStack();

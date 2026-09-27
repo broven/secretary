@@ -7,6 +7,7 @@ import type { Approver, ApprovalCard, ApprovalCardItem, SightingCard } from "./a
 import { encryptCredentialEnvelope, parseClientPublicKeyJwk } from "./envelope.ts";
 import {
   commandFingerprint,
+  grantCoverageExpiry,
   GrantRevokedDuringApprovalError,
   GrantStore,
   secretGrantKey,
@@ -55,7 +56,8 @@ const SHELL_BINARIES = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish", "csh
  *
  * These commands are fully visible in argv, so they are not forbidden —
  * forbidding them would just push agents into opaque temp scripts. The price:
- * every run needs human approval and never writes a Grant. Detection is
+ * they are covered only by a Grant's separate inline permission, which the
+ * Owner grants explicitly from a card that says so (ADR-0009). Detection is
  * best-effort (the threat model is mistakes, not malice): `env A=1 sh -c ...`
  * is unwrapped and still detected, deliberate evasion is out of scope.
  */
@@ -328,7 +330,7 @@ export class RequestBroker {
     // Bind any eventual Grant save to the Item/Field generations observed
     // immediately after vault resolution. A destructive Write can advance a
     // generation while this Request is parked for Approval.
-    const revocationSnapshot = inlineShell ? undefined : this.deps.grants.snapshotRevocations(units);
+    const revocationSnapshot = this.deps.grants.snapshotRevocations(units);
     const grantKeys = units.map((unit) => secretGrantKey(identity, unit));
     const cardItems: ApprovalCardItem[] = request.items.map((item) => ({
       name: item.name,
@@ -336,55 +338,62 @@ export class RequestBroker {
       bindings: item.bindings,
     }));
 
-    // Inline shell never consumes and never writes grants: always human-approved.
-    if (!inlineShell) {
-      const active = this.deps.grants.findActive(grantKeys);
-      if (grantKeys.every((key) => active.has(key))) {
-        const grants = grantKeys.map((key) => active.get(key)!);
-        // The reuse window ends when the earliest unit expires — after that the set no longer hits.
-        const expiresAt = grants.map((grant) => grant.expires_at).sort()[0];
-        const ttl = grants.map((grant) => grant.ttl)
-          .sort((a, b) => secretGrantTtlHours(a) - secretGrantTtlHours(b))[0];
-        const sighting = this.deps.grants.recordSighting(identity, commandHash, grantKeys);
-        if (!sighting.seen_before) {
-          const card: SightingCard = {
-            id: request.request_id,
-            reason: request.reason,
-            command: commandDisplay,
-            items: cardItems,
-            repo: request.repo,
-            host: request.host,
-            user: request.user,
-            agent: request.agent || undefined,
-            client_name: client.name,
-            expires_at: expiresAt,
-            grant_keys: grantKeys,
-          };
-          // Persist the revoke-button mapping BEFORE the notification goes
-          // out, so the button resolves even across a broker restart.
-          try {
-            this.deps.grants.saveRevokeHandle(request.request_id, grantKeys);
-          } catch (error) {
-            this.log(`saving revoke handle failed: ${error instanceof Error ? error.message : String(error)}`);
-          }
-          // Fire and forget: a Sighting informs, it never gates delivery.
-          void this.deps.approver.notifySighting(card).catch((error) => {
-            this.log(`sighting notification failed: ${error instanceof Error ? error.message : String(error)}`);
-          });
-        }
-        const envelope = await this.encryptForRequest(request, units);
-        this.log(`request ${request.request_id}: fast path (${client.name} @ ${request.repo})`);
-        return {
-          approved: true,
-          ttl,
+    // Fast path. Inline code is covered only by inline permission; an
+    // ordinary command by either kind (grantCoverageExpiry).
+    const active = this.deps.grants.findActive(grantKeys);
+    const coveredUntil = grantKeys.map((key) => {
+      const grant = active.get(key);
+      return grant ? grantCoverageExpiry(grant, inlineShell, this.now()) : null;
+    });
+    if (coveredUntil.every((until) => until !== null)) {
+      const grants = grantKeys.map((key) => active.get(key)!);
+      // The reuse window ends when the earliest unit expires — after that the set no longer hits.
+      const expiresAt = (coveredUntil as string[]).sort()[0];
+      const ttl = grants.map((grant) => grant.ttl)
+        .sort((a, b) => secretGrantTtlHours(a) - secretGrantTtlHours(b))[0];
+      const sighting = this.deps.grants.recordSighting(identity, commandHash, grantKeys);
+      if (!sighting.seen_before) {
+        const card: SightingCard = {
+          id: request.request_id,
+          reason: request.reason,
+          command: commandDisplay,
+          inline_shell: inlineShell,
+          // Offer "revoke only the inline part" whenever there is one to revoke,
+          // even when this particular command was an ordinary one.
+          inline_grant: grants.some((grant) => grantCoverageExpiry(grant, true, this.now()) !== null),
+          items: cardItems,
+          repo: request.repo,
+          host: request.host,
+          user: request.user,
+          agent: request.agent || undefined,
+          client_name: client.name,
           expires_at: expiresAt,
-          lease_id: grants[0].approval_id,
-          grant_reused: true,
-          decided_by: grants[0].decided_by,
-          decided_at: grants[0].decided_at,
-          credential_envelope: envelope,
+          grant_keys: grantKeys,
         };
+        // Persist the revoke-button mapping BEFORE the notification goes
+        // out, so the button resolves even across a broker restart.
+        try {
+          this.deps.grants.saveRevokeHandle(request.request_id, grantKeys);
+        } catch (error) {
+          this.log(`saving revoke handle failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        // Fire and forget: a Sighting informs, it never gates delivery.
+        void this.deps.approver.notifySighting(card).catch((error) => {
+          this.log(`sighting notification failed: ${error instanceof Error ? error.message : String(error)}`);
+        });
       }
+      const envelope = await this.encryptForRequest(request, units);
+      this.log(`request ${request.request_id}: fast path (${client.name} @ ${request.repo}${inlineShell ? ", inline shell" : ""})`);
+      return {
+        approved: true,
+        ttl,
+        expires_at: expiresAt,
+        lease_id: grants[0].approval_id,
+        grant_reused: true,
+        decided_by: grants[0].decided_by,
+        decided_at: grants[0].decided_at,
+        credential_envelope: envelope,
+      };
     }
 
     // Approval path: park in memory until decision or timeout (fail closed).
@@ -409,7 +418,10 @@ export class RequestBroker {
       return { approved: false, denied_reason: decision.reason };
     }
 
-    const ttl: ApprovalTtl = inlineShell ? "once" : (isSecretGrantTtl(decision.ttl) ? decision.ttl : "1h");
+    // Inline: a TTL mints inline permission; anything else is "once" (this
+    // run, nothing remembered) — never a wider fallback. Ordinary: always a
+    // TTL, "once" is never offered there.
+    const ttl: ApprovalTtl = isSecretGrantTtl(decision.ttl) ? decision.ttl : (inlineShell ? "once" : "1h");
     let expiresAt = leaseExpiresAt(ttl, this.now());
     if (ttl !== "once") {
       let saved;
@@ -422,6 +434,7 @@ export class RequestBroker {
           decision.decided_by,
           decision.decided_at,
           revocationSnapshot,
+          { inline: inlineShell },
         );
       } catch (error) {
         if (error instanceof GrantRevokedDuringApprovalError) {
@@ -429,7 +442,7 @@ export class RequestBroker {
         }
         throw error;
       }
-      expiresAt = saved.map((grant) => grant.expires_at).sort()[0];
+      expiresAt = saved.map((grant) => grantCoverageExpiry(grant, inlineShell, this.now())!).sort()[0];
       // The command just reviewed on the card must be remembered, or the next
       // fast-path hit would immediately re-notify.
       this.deps.grants.recordSighting(identity, commandHash, grantKeys);

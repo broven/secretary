@@ -69,6 +69,14 @@ if *every* requested (item, field) pair has an unexpired Grant (containment
 match). Extending never shortens: a new short TTL cannot cut an existing longer
 Grant.
 
+A Grant carries two independent expiries. The **ordinary** one covers named
+commands; the **inline** one covers Inline shell and is written only by an
+inline card's TTL buttons. Inline permission contains ordinary permission, so
+an ordinary command is covered by either; inline code only by the inline one.
+Neither approval path moves the other's expiry, and the Owner can withdraw the
+inline one alone. The Owner lists live Grants — one entry per Approval — with
+`/grants` in the Approver's chat (ADR-0009).
+
 ## Repo
 
 The identity of the codebase a Request originates from, derived from the git
@@ -77,16 +85,21 @@ in a different repo needs its own Approval.
 
 ## Inline shell
 
-A command whose argv embeds code to evaluate (`sh -c`, `python -c`, …). Inline
-shell Requests are detected by the Broker, always require Approval, and never
-create Grants — the command string is unauditable, so nothing is remembered.
+A command whose argv embeds code to evaluate (`sh -c`, `python -c`, …). Detected
+by the Broker and covered only by a Grant's inline permission. Its card offers
+"this run only" first — approved, remembered nowhere — and TTL buttons whose
+labels say they cover *any* inline code in that repo, not just the code on the
+card. The Owner judges on the card; no Item is pre-marked and no repo is
+allow-listed for it (ADR-0009).
 
 ## Sighting
 
 The first time a given command argv fingerprint is seen under an existing Grant.
-A Sighting does not block; it sends the Owner a non-blocking notification with a
-revoke button. The command is informational — it is not part of what a Grant
-authorizes.
+A Sighting does not block; it sends the Owner a *silent* notification — only
+cards that need a tap to proceed may ring — carrying the full command (for
+Inline shell, the full code) and a revoke button, plus "revoke only the inline
+permission" when the Grant has one. The command is informational — it is not
+part of what a Grant authorizes.
 
 ## Envelope
 

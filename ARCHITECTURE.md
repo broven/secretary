@@ -57,7 +57,8 @@ stays the source of truth), Windows support for the CLI (macOS/Linux first).
 2. Broker resolves items against its vault session (resident `BW_SESSION`,
    on-demand `bw sync`), checks Grant containment in SQLite.
 3. **Fast path**: all pairs granted → encrypt Envelope, respond on the same
-   connection. First-seen argv additionally fires a non-blocking Sighting
+   connection. Inline shell counts only a Grant's inline expiry; an ordinary
+   command counts either. First-seen argv additionally fires a silent Sighting
    notification with a revoke button.
 4. **Approval path**: broker sends the Telegram card (approve 1h/8h/7d/30d, reject),
    parks the request in memory, and resolves it when the button callback arrives
@@ -143,7 +144,12 @@ Ported unchanged from the predecessor:
   rejected as aliases.
 - **Grant model**: containment matching, TTLs of 1h/8h/7d/30d, `GREATEST` semantics on
   extension, no command in the key (Sightings cover that, non-blocking).
-- **Inline shell**: always approve, never grant.
+- **Inline shell**: never covered by an ordinary Grant. Its card offers "this run
+  only" first; its TTL buttons grant a separate, separately revocable inline
+  expiry and say on their face that it covers any inline code in the repo
+  (ADR-0009).
+- **Owner overview**: `/grants` in the Approver chat lists live Grants per
+  Approval with one-tap revoke (all, or only the inline permission).
 - **Fail closed**: timeout or any ambiguity → no secrets.
 - **Write path**: every write is approved and creates no Grant; values reach the Owner
   only as Fingerprints; `bw delete --permanent` is never reachable. Its transport

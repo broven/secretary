@@ -1,13 +1,17 @@
 // Fake Telegram Bot API server for integration tests.
 //
 // Implements just enough of sendMessage / getUpdates / answerCallbackQuery /
-// editMessageReplyMarkup / deleteMessage for the TelegramApprover's long-poll
-// loop, including offset-based acknowledgement so updates are never
-// redelivered.
+// editMessageReplyMarkup / editMessageText / deleteMessage for the
+// TelegramApprover's long-poll loop, including offset-based acknowledgement so
+// updates are never redelivered.
 
 export type FakeSentMessage = {
+  message_id: number;
   chat_id: string | number;
   text: string;
+  parse_mode?: string;
+  /** True when the message was sent silently (no push notification). */
+  disable_notification?: boolean;
   reply_markup?: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
 };
 
@@ -20,10 +24,17 @@ export type FakeTelegram = {
   answeredCallbacks: Array<{ callback_query_id: string; text?: string }>;
   /** Parsed editMessageReplyMarkup bodies in order. */
   editedMarkups: Array<{ chat_id: string | number; message_id: number; reply_markup: unknown }>;
+  /** Parsed editMessageText bodies in order. */
+  editedTexts: Array<FakeSentMessage & { parse_mode?: string }>;
   /** message_ids passed to deleteMessage, in order. */
   deletedMessageIds: number[];
-  /** Enqueue a callback_query update, delivered by the pending or next getUpdates call. */
-  pressButton(callbackData: string, fromUserId: number): void;
+  /**
+   * Enqueue a callback_query update, delivered by the pending or next getUpdates
+   * call. The press lands on `messageId`, defaulting to the last sent message.
+   */
+  pressButton(callbackData: string, fromUserId: number, messageId?: number): void;
+  /** Enqueue a plain text message update, as if a user typed into a chat. */
+  sendText(text: string, fromUserId: number, chatId: string | number): void;
   stop(): void;
 };
 
@@ -33,15 +44,22 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
   const sentMessages: FakeSentMessage[] = [];
   const answeredCallbacks: FakeTelegram["answeredCallbacks"] = [];
   const editedMarkups: FakeTelegram["editedMarkups"] = [];
+  const editedTexts: FakeTelegram["editedTexts"] = [];
   const deletedMessageIds: number[] = [];
 
   type Update = {
     update_id: number;
-    callback_query: {
+    callback_query?: {
       id: string;
       from: { id: number };
       message: { message_id: number; chat: { id: string | number } };
       data: string;
+    };
+    message?: {
+      message_id: number;
+      from: { id: number };
+      chat: { id: string | number };
+      text: string;
     };
   };
 
@@ -76,8 +94,11 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
         const messageId = nextMessageId++;
         lastMessage = { message_id: messageId, chat_id: body.chat_id as string | number };
         sentMessages.push({
+          message_id: messageId,
           chat_id: body.chat_id as string | number,
           text: String(body.text ?? ""),
+          parse_mode: body.parse_mode as string | undefined,
+          disable_notification: body.disable_notification as boolean | undefined,
           reply_markup: body.reply_markup as FakeSentMessage["reply_markup"],
         });
         return Response.json({ ok: true, result: { message_id: messageId } });
@@ -117,6 +138,17 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
         return Response.json({ ok: true, result: true });
       }
 
+      if (method === "editMessageText") {
+        editedTexts.push({
+          message_id: Number(body.message_id),
+          chat_id: body.chat_id as string | number,
+          text: String(body.text ?? ""),
+          parse_mode: body.parse_mode as string | undefined,
+          reply_markup: body.reply_markup as FakeSentMessage["reply_markup"],
+        });
+        return Response.json({ ok: true, result: true });
+      }
+
       if (method === "editMessageReplyMarkup") {
         editedMarkups.push({
           chat_id: body.chat_id as string | number,
@@ -135,16 +167,27 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
     sentMessages,
     answeredCallbacks,
     editedMarkups,
+    editedTexts,
     deletedMessageIds,
-    pressButton(callbackData: string, fromUserId: number): void {
+    pressButton(callbackData: string, fromUserId: number, messageId?: number): void {
+      const target = messageId === undefined
+        ? lastMessage
+        : { message_id: messageId, chat_id: sentMessages.find((m) => m.message_id === messageId)?.chat_id ?? 0 };
       queue.push({
         update_id: nextUpdateId++,
         callback_query: {
           id: `cb-${nextCallbackId++}`,
           from: { id: fromUserId },
-          message: { message_id: lastMessage.message_id, chat: { id: lastMessage.chat_id } },
+          message: { message_id: target.message_id, chat: { id: target.chat_id } },
           data: callbackData,
         },
+      });
+      deliverToWaiter();
+    },
+    sendText(text: string, fromUserId: number, chatId: string | number): void {
+      queue.push({
+        update_id: nextUpdateId++,
+        message: { message_id: 100_000 + nextUpdateId, from: { id: fromUserId }, chat: { id: chatId }, text },
       });
       deliverToWaiter();
     },

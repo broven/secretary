@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import type { ApprovalCard, SightingCard, WriteCard } from "../src/approver.ts";
+import type { ApprovalCard, GrantListEntry, SightingCard, WriteCard } from "../src/approver.ts";
 import {
   buildApprovalMessages,
+  buildGrantsPage,
   buildWriteMessages,
+  GRANTS_PAGE_SIZE,
   TELEGRAM_MESSAGE_LIMIT,
   TelegramApprover,
 } from "../src/approver_telegram.ts";
@@ -14,19 +16,44 @@ const OTHER_USER = 999;
 let fake: FakeTelegram;
 let approver: TelegramApprover;
 let revokedCalls: string[];
+let inlineRevokedCalls: string[];
 // A durable-store stand-in: sighting id -> number of grant rows it deletes.
 let revokeHandles: Map<string, number>;
+// A grant-store stand-in for /grants: revoking removes the entry (all) or
+// strips its inline expiry (inline), like the real store does.
+let grantEntries: GrantListEntry[];
+let approvalRevocations: Array<[string, "all" | "inline"]>;
 
 beforeEach(async () => {
   fake = await startFakeTelegram();
   revokedCalls = [];
+  inlineRevokedCalls = [];
   revokeHandles = new Map();
+  grantEntries = [];
+  approvalRevocations = [];
   approver = new TelegramApprover(
     { botToken: "TEST_TOKEN", chatId: "555", allowedUserIds: [ALLOWED_USER], apiBase: fake.url },
     {
       onRevoke: (sightingId) => {
         revokedCalls.push(sightingId);
         return revokeHandles.get(sightingId) ?? null;
+      },
+      onRevokeInline: (sightingId) => {
+        inlineRevokedCalls.push(sightingId);
+        return revokeHandles.get(sightingId) ?? null;
+      },
+      listGrants: () => grantEntries,
+      revokeApproval: (approvalId, scope) => {
+        approvalRevocations.push([approvalId, scope]);
+        const before = grantEntries.length;
+        grantEntries = scope === "all"
+          ? grantEntries.filter((entry) => entry.approval_id !== approvalId)
+          : grantEntries.map((entry) => {
+            if (entry.approval_id !== approvalId) return entry;
+            const { inline_expires_at: _dropped, ...rest } = entry;
+            return rest;
+          });
+        return scope === "all" ? before - grantEntries.length : 1;
       },
     },
     { log: () => {} },
@@ -75,6 +102,8 @@ function makeSightingCard(overrides: Partial<SightingCard> = {}): SightingCard {
     client_name: "client-abc",
     expires_at: new Date(Date.now() + 3_600_000).toISOString(),
     grant_keys: ["grant:a", "grant:b"],
+    inline_shell: false,
+    inline_grant: false,
     ...overrides,
   };
 }
@@ -139,21 +168,52 @@ test("renders the approval card with escaped command, item name, and 5 buttons",
   await decision;
 });
 
-test("inline shell card gets only approve_once and deny buttons", async () => {
+test("inline shell card keeps approve_once first and offers TTLs that state their scope", async () => {
   const card = makeCard({ inline_shell: true, command: 'sh -c "echo hi"' });
   const decision = approver.requestApproval(card, 5000);
   await waitFor(() => fake.sentMessages.length === 1);
 
   const buttons = keyboardButtons(0);
-  expect(buttons.length).toBe(2);
+  expect(buttons.map((button) => button.callback_data)).toEqual([
+    `ap:${card.id}:approve_once`,
+    `ap:${card.id}:approve_1h`,
+    `ap:${card.id}:approve_8h`,
+    `ap:${card.id}:approve_7d`,
+    `ap:${card.id}:approve_30d`,
+    `ap:${card.id}:deny`,
+  ]);
   expect(buttons[0].text).toContain("批准本次执行");
-  expect(buttons[0].callback_data).toBe(`ap:${card.id}:approve_once`);
-  expect(buttons[1].callback_data).toBe(`ap:${card.id}:deny`);
-  expect(fake.sentMessages[0].text).toContain("内联 shell 代码");
+  for (const button of buttons.slice(1, 5)) expect(button.text).toContain("含任意内联代码");
+  // One per row: a two-up layout would cut the warning off the label.
+  expect(fake.sentMessages[0].reply_markup!.inline_keyboard.every((row) => row.length === 1)).toBe(true);
+  // The scope warning sits directly under the title, above the reason.
+  const lines = fake.sentMessages[0].text.split("\n");
+  expect(lines[1]).toContain("本仓库内任意内联代码可免审使用这些密钥");
+  // It rings: an approval card needs a tap to proceed.
+  expect(fake.sentMessages[0].disable_notification).toBeUndefined();
 
-  fake.pressButton(`ap:${card.id}:approve_once`, ALLOWED_USER);
+  fake.pressButton(`ap:${card.id}:approve_7d`, ALLOWED_USER);
   const result = await decision;
-  expect(result).toMatchObject({ approved: true, ttl: "once", decided_by: String(ALLOWED_USER) });
+  expect(result).toMatchObject({ approved: true, ttl: "7d", decided_by: String(ALLOWED_USER) });
+});
+
+test("approve_once still resolves an inline card as this-run-only", async () => {
+  const card = makeCard({ inline_shell: true, command: 'sh -c "echo hi"' });
+  const decision = approver.requestApproval(card, 5000);
+  await waitFor(() => fake.sentMessages.length === 1);
+  fake.pressButton(`ap:${card.id}:approve_once`, ALLOWED_USER);
+  await expect(decision).resolves.toMatchObject({ approved: true, ttl: "once" });
+});
+
+test("a forged approve_once on an ordinary card is refused and leaves it pending", async () => {
+  const card = makeCard();
+  const decision = approver.requestApproval(card, 5000);
+  await waitFor(() => fake.sentMessages.length === 1);
+  fake.pressButton(`ap:${card.id}:approve_once`, ALLOWED_USER);
+  await waitFor(() => fake.answeredCallbacks.length === 1);
+  expect(fake.answeredCallbacks[0].text).toBe("未知操作");
+  fake.pressButton(`ap:${card.id}:deny`, ALLOWED_USER);
+  await expect(decision).resolves.toEqual({ approved: false, reason: "denied" });
 });
 
 test("approve_8h from an allowed user resolves approved with ttl 8h", async () => {
@@ -303,6 +363,8 @@ test("notifySighting sends a revoke button and pressing it calls onRevoke by id"
   expect(fake.sentMessages.length).toBe(1);
   expect(fake.sentMessages[0].text).toContain("密钥免审复用");
   expect(fake.sentMessages[0].text).toContain("授权到期");
+  // Nothing waits on a Sighting, so it must not ring.
+  expect(fake.sentMessages[0].disable_notification).toBe(true);
 
   const buttons = keyboardButtons(0);
   expect(buttons.length).toBe(1);
@@ -491,4 +553,133 @@ test("a how-to-get change is titled as one, not as a description change", () => 
   expect(text).toContain("改获取方式");
   expect(text).not.toContain("改条目描述");
   expect(text).toContain("Settings → Developer → Tokens");
+});
+
+// -- Inline permission on Sightings (ADR-0009) --------------------------------
+
+test("a sighting over inline permission offers inline-only and full revoke, silently", async () => {
+  const card = makeSightingCard({ inline_shell: true, inline_grant: true, command: 'sh -c "tool --push"' });
+  revokeHandles.set(card.id, 1);
+  await approver.notifySighting(card);
+  expect(fake.sentMessages.every((message) => message.disable_notification === true)).toBe(true);
+  expect(fake.sentMessages[0].text).toContain("内联代码免审复用");
+  expect(keyboardButtons(fake.sentMessages.length - 1).map((button) => button.callback_data))
+    .toEqual([`ri:${card.id}`, `rv:${card.id}`]);
+
+  fake.pressButton(`ri:${card.id}`, ALLOWED_USER);
+  await waitFor(() => fake.editedMarkups.length === 1);
+  expect(inlineRevokedCalls).toEqual([card.id]);
+  expect(revokedCalls).toEqual([]);
+  expect(fake.answeredCallbacks[0].text).toContain("内联权限");
+  // The ordinary part is still live, so its revoke button must survive.
+  const remaining = (fake.editedMarkups[0].reply_markup as { inline_keyboard: Array<Array<{ callback_data: string }>> })
+    .inline_keyboard.flat().map((button) => button.callback_data);
+  expect(remaining).toEqual([`rv:${card.id}`]);
+});
+
+test("an inline sighting shows all of the code even under worst-case escaping", async () => {
+  // formatCommandDisplay bounds the display near 900 chars; every one of them
+  // expanding to an HTML entity must still arrive whole.
+  const code = `sh -c ${"<&".repeat(450)}END`;
+  const card = makeSightingCard({ inline_shell: true, inline_grant: true, command: code });
+  await approver.notifySighting(card);
+  const combined = fake.sentMessages.map((message) => message.text).join("\n");
+  // Counted separately: a chunk boundary may fall between the two entities.
+  expect(combined.match(/&lt;/g)).toHaveLength(450);
+  expect(combined.match(/&amp;/g)).toHaveLength(450);
+  expect(combined).toContain("END");
+  expect(fake.sentMessages.every((message) => message.text.length <= TELEGRAM_MESSAGE_LIMIT)).toBe(true);
+  // Buttons ride on the last message only.
+  expect(fake.sentMessages.at(-1)!.reply_markup).toBeDefined();
+  for (const message of fake.sentMessages.slice(0, -1)) expect(message.reply_markup).toBeUndefined();
+});
+
+// -- /grants ------------------------------------------------------------------
+
+function makeEntry(index: number, overrides: Partial<GrantListEntry> = {}): GrantListEntry {
+  return {
+    approval_id: crypto.randomUUID(),
+    repo: `github.com/acme/repo-${index}`,
+    client_name: "client-abc",
+    items: [{ name: `Item ${index}`, fields: ["password"] }],
+    expires_at: new Date(Date.UTC(2030, 0, 1, index)).toISOString(),
+    ...overrides,
+  };
+}
+
+test("/grants from the Owner in the chat lists grants as plain text, silently", async () => {
+  grantEntries = [makeEntry(1), makeEntry(2, { inline_expires_at: "2030-01-02T03:04:05.000Z" })];
+  fake.sendText("/grants", ALLOWED_USER, "555");
+  await waitFor(() => fake.sentMessages.length === 1);
+  const message = fake.sentMessages[0];
+  expect(message.parse_mode).toBeUndefined();
+  expect(message.disable_notification).toBe(true);
+  expect(message.text).toContain("github.com/acme/repo-1");
+  expect(message.text).toContain("Item 2（password）");
+  expect(message.text).toContain("内联到期：2030-01-02 03:04 UTC");
+  const buttons = keyboardButtons(0);
+  // Only the entry with inline permission gets the inline-only button.
+  expect(buttons.map((button) => button.callback_data)).toEqual([
+    `ga:0:${grantEntries[0].approval_id}`,
+    `gi:0:${grantEntries[1].approval_id}`,
+    `ga:0:${grantEntries[1].approval_id}`,
+  ]);
+});
+
+test("/grants is ignored from anyone but the Owner, and outside the configured chat", async () => {
+  grantEntries = [makeEntry(1)];
+  fake.sendText("/grants", OTHER_USER, "555");
+  fake.sendText("/grants", ALLOWED_USER, "777");
+  // A marker the approver does answer, so we know the two above were processed.
+  fake.sendText("/grants@secretary_bot", ALLOWED_USER, "555");
+  await waitFor(() => fake.sentMessages.length === 1);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  expect(fake.sentMessages).toHaveLength(1);
+});
+
+test("/grants pages in place and revokes from the listing", async () => {
+  grantEntries = Array.from({ length: GRANTS_PAGE_SIZE * 2 + 3 }, (_, index) =>
+    makeEntry(index, { inline_expires_at: "2030-02-01T00:00:00.000Z" }));
+  fake.sendText("/grants", ALLOWED_USER, "555");
+  await waitFor(() => fake.sentMessages.length === 1);
+  expect(fake.sentMessages[0].text).toContain("第 1/3 页");
+  const listingId = fake.sentMessages[0].message_id;
+
+  fake.pressButton("gp:2", ALLOWED_USER, listingId);
+  await waitFor(() => fake.editedTexts.length === 1);
+  expect(fake.editedTexts[0].message_id).toBe(listingId);
+  expect(fake.editedTexts[0].text).toContain("第 3/3 页");
+  expect(fake.editedTexts[0].text).toContain(`#${GRANTS_PAGE_SIZE * 2 + 3} `);
+
+  const target = grantEntries[GRANTS_PAGE_SIZE * 2];
+  fake.pressButton(`gi:2:${target.approval_id}`, ALLOWED_USER, listingId);
+  await waitFor(() => fake.editedTexts.length === 2);
+  fake.pressButton(`ga:2:${target.approval_id}`, ALLOWED_USER, listingId);
+  await waitFor(() => fake.editedTexts.length === 3);
+  expect(approvalRevocations).toEqual([[target.approval_id, "inline"], [target.approval_id, "all"]]);
+  expect(fake.answeredCallbacks.map((answer) => answer.text)).toContain("已吊销 1 行");
+  expect(fake.editedTexts[2].text).not.toContain(target.repo);
+
+  // A stranger cannot revoke through the listing.
+  fake.pressButton(`ga:0:${grantEntries[0].approval_id}`, OTHER_USER, listingId);
+  await waitFor(() => fake.answeredCallbacks.length === 4);
+  expect(fake.answeredCallbacks[3].text).toBe("无权操作");
+  expect(approvalRevocations).toHaveLength(2);
+});
+
+test("a full page of worst-case entries fits one message and every callback fits 64 bytes", () => {
+  const long = "&<".repeat(200);
+  const entries = Array.from({ length: GRANTS_PAGE_SIZE }, (_, index) => makeEntry(index, {
+    repo: long,
+    client_name: long,
+    items: Array.from({ length: 10 }, (_, item) => ({ name: `${long}${item}`, fields: ["password", "username"] })),
+    inline_expires_at: "2030-02-01T00:00:00.000Z",
+  }));
+  const view = buildGrantsPage([...entries, ...entries], 0);
+  expect(view.text.length).toBeLessThanOrEqual(4096);
+  // Plain text: nothing is escaped, so what the Owner sees is the raw string.
+  expect(view.text).toContain("&<&<");
+  const callbacks = view.reply_markup.inline_keyboard.flat().map((button) => button.callback_data);
+  expect(callbacks).toHaveLength(GRANTS_PAGE_SIZE * 2 + 1);
+  for (const data of callbacks) expect(new TextEncoder().encode(data).length).toBeLessThanOrEqual(64);
 });

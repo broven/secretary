@@ -1,5 +1,6 @@
 // TelegramApprover: delivers approval cards and Sighting notifications to a
-// Telegram chat and turns inline-keyboard callbacks into ApprovalDecisions.
+// Telegram chat, turns inline-keyboard callbacks into ApprovalDecisions, and
+// answers the Owner's /grants command with a pageable listing.
 //
 // Rendering, escaping, field limits, and the callback_data format are ported
 // from the Windmill references (f/approval/approval_telegram.ts and
@@ -16,6 +17,7 @@ import type {
   ApprovalCard,
   ApprovalDecision,
   Approver,
+  GrantListEntry,
   SightingCard,
   WriteCard,
   WriteCardKind,
@@ -28,8 +30,9 @@ import { isSecretGrantTtl, type ApprovalTtl } from "./types.ts";
 // Rendering (ported from approval_telegram.ts)
 // ---------------------------------------------------------------------------
 
-/** Max fields rendered in one Telegram message (Sighting notifications only —
- * approval cards render completely or fail closed, see buildApprovalMessages). */
+/** Max fields rendered in one Telegram message (write notes only — approval
+ * cards and Sightings render their command completely, see
+ * buildApprovalMessages / buildSightingMessages). */
 export const MAX_TELEGRAM_FIELDS = 6;
 /** Character budget for a plain field value. */
 export const FIELD_VALUE_LIMIT = 320;
@@ -142,6 +145,9 @@ function completeValueBlocks(label: string, value: unknown, monospace: boolean):
 export function buildApprovalMessages(card: ApprovalCard): string[] {
   const header = [
     `🔔 <b>${escapeHtml(limit(`密钥使用审批：${card.items.length} 个 Bitwarden 条目 @ ${card.repo || "?"}`, 180))}</b>`,
+    // Right under the title, before anything else: this is what a TTL button
+    // on an inline card actually hands out (ADR-0009).
+    ...(card.inline_shell ? [`⚠️ <b>${escapeHtml(INLINE_GRANT_WARNING)}</b>`] : []),
     ...(card.reason ? [escapeHtml(limit(card.reason, 400))] : []),
   ].join("\n");
   const footer = `<i>审批截止：${escapeHtml(card.expires_at)} · 请直接点击下方按钮提交审批决定。</i>`;
@@ -151,9 +157,6 @@ export function buildApprovalMessages(card: ApprovalCard): string[] {
     // The command display is already bounded upstream (formatCommandDisplay
     // truncates at 900 chars + fingerprint); it is never truncated here.
     blocks.push(`<b>命令</b>:\n<pre><code class="language-bash">${escapeHtml(card.command)}</code></pre>`);
-  }
-  if (card.inline_shell) {
-    blocks.push(`<b>注意</b>: ${escapeHtml("内联 shell 代码：只放行本次执行，不会写入免审授权。")}`);
   }
   card.items.forEach((item, index) => {
     // Decision-critical: the mapping renders in full, never limited.
@@ -279,27 +282,131 @@ export function buildWriteNoteText(note: WriteNote): string {
   );
 }
 
-export function buildSightingText(card: SightingCard): string {
-  // Ported from buildReuseContext: the whole point of this notification is
-  // "what ran, with which keys, until when".
-  const fields: CardField[] = [
-    ...(card.command ? [{ label: "命令", value: card.command, block: true }] : []),
-    ...card.items.map((item, index) => ({
-      label: `密钥 ${index + 1} · ${item.name}`,
-      value: `字段映射：${item.bindings.map((binding) => `${binding.field} → ${binding.env}`).join("，")}`,
-      monospace: false,
-    })),
-    { label: "授权到期", value: card.expires_at },
-    { label: "仓库", value: card.repo },
-    { label: "来源", value: [card.host, card.user, card.agent].filter(Boolean).join(" · ") },
-    ...(card.client_name ? [{ label: "客户端", value: card.client_name }] : []),
-  ].filter((field) => field.value);
-  return renderCardText(
-    `密钥免审复用：${card.items.length} 个条目 @ ${card.repo || "?"}`,
-    `这条命令第一次用到这套密钥（已按既有授权放行）。理由：${card.reason}`,
-    fields,
-    "<i>删除本次用到的授权行；该仓库其它授权不受影响。</i>",
-  );
+/**
+ * Render a Sighting. The whole point of this notification is "what ran, with
+ * which keys, until when" (ported from buildReuseContext).
+ *
+ * The command renders COMPLETELY (split across messages when needed, keyboard
+ * on the last): for inline code the code is the only evidence of what the
+ * secret was used for, and the Owner never saw this run's code on any card.
+ * Only the free-form pieces are truncated.
+ */
+export function buildSightingMessages(card: SightingCard): string[] {
+  const kind = card.inline_shell ? "内联代码免审复用" : "密钥免审复用";
+  const header = [
+    `🔔 <b>${escapeHtml(limit(`${kind}：${card.items.length} 个条目 @ ${card.repo || "?"}`, 180))}</b>`,
+    escapeHtml(limit(`这条命令第一次用到这套密钥（已按既有授权放行）。理由：${card.reason}`, 400)),
+  ].join("\n");
+  const footer = card.inline_grant
+    ? "<i>「只撤内联权限」保留普通命令的免审；「全部吊销」删除本次用到的授权行。该仓库其它授权不受影响。</i>"
+    : "<i>删除本次用到的授权行；该仓库其它授权不受影响。</i>";
+
+  const blocks: string[] = [];
+  if (card.command) {
+    // Already bounded upstream (formatCommandDisplay); chunked here only so
+    // worst-case HTML escaping cannot push it past one message.
+    escapeCompleteValue(card.command).forEach((chunk, index) => {
+      const label = index === 0 ? "命令" : `命令（续 ${index + 1}）`;
+      blocks.push(`<b>${label}</b>:\n<pre><code class="language-bash">${chunk}</code></pre>`);
+    });
+  }
+  card.items.forEach((item, index) => {
+    const mapping = `字段映射：${item.bindings.map((binding) => `${binding.field} → ${binding.env}`).join("，")}`;
+    blocks.push(
+      `<b>${escapeHtml(limit(`密钥 ${index + 1} · ${item.name}`, 260))}</b>: ${escapeHtml(limit(mapping, FIELD_VALUE_LIMIT))}`,
+    );
+  });
+  blocks.push([
+    `<b>授权到期</b>: <code>${escapeHtml(card.expires_at)}</code>`,
+    `<b>仓库</b>: <code>${escapeHtml(limit(card.repo, FIELD_VALUE_LIMIT))}</code>`,
+    `<b>来源</b>: <code>${escapeHtml(limit([card.host, card.user, card.agent].filter(Boolean).join(" · "), FIELD_VALUE_LIMIT))}</code>`,
+    ...(card.client_name ? [`<b>客户端</b>: <code>${escapeHtml(limit(card.client_name, FIELD_VALUE_LIMIT))}</code>`] : []),
+  ].join("\n"));
+
+  const messages: string[] = [];
+  let current = header;
+  for (const block of blocks) {
+    if (current.length + 2 + block.length > TELEGRAM_MESSAGE_LIMIT) {
+      messages.push(current);
+      current = `🔔 <b>${escapeHtml(`${kind}（续 ${messages.length + 1}）`)}</b>`;
+    }
+    current += `\n\n${block}`;
+  }
+  if (current.length + 2 + footer.length > TELEGRAM_MESSAGE_LIMIT) {
+    messages.push(current);
+    current = `🔔 <b>${escapeHtml(`${kind}（续 ${messages.length + 1}）`)}</b>`;
+  }
+  messages.push(`${current}\n\n${footer}`);
+  return messages;
+}
+
+// ---------------------------------------------------------------------------
+// Grant listing (/grants)
+// ---------------------------------------------------------------------------
+
+/** Entries per /grants page. */
+export const GRANTS_PAGE_SIZE = 10;
+
+/** Compact UTC rendering for the listing; cards keep full ISO timestamps. */
+function shortTime(iso: string): string {
+  return `${iso.slice(0, 16).replace("T", " ")} UTC`;
+}
+
+function grantEntryText(entry: GrantListEntry, number: number): string {
+  // Every line is bounded so that a full page of worst-case entries still
+  // fits one message (10 × ~380 chars + header < 4096).
+  const items = entry.items
+    .map((item) => `${item.name}（${item.fields.join("、")}）`)
+    .join("；");
+  return [
+    `#${number} ${limit(entry.repo, 100)}`,
+    `  条目：${limit(items, 160)}`,
+    `  普通到期：${entry.expires_at ? shortTime(entry.expires_at) : "—（仅内联授权）"}`,
+    ...(entry.inline_expires_at ? [`  ⚠️ 内联到期：${shortTime(entry.inline_expires_at)}`] : []),
+    `  客户端：${limit(entry.client_name, 40)}`,
+  ].join("\n");
+}
+
+/**
+ * One page of the Owner's grant listing, as PLAIN text (no parse_mode): repo
+ * and item names are arbitrary strings, and a MarkdownV2 escaping slip would
+ * make the listing undeliverable — the same reason How-to-get is plain text.
+ */
+export function buildGrantsPage(
+  entries: GrantListEntry[],
+  requestedPage: number,
+): { page: number; text: string; reply_markup: TelegramInlineKeyboard } {
+  const pages = Math.max(1, Math.ceil(entries.length / GRANTS_PAGE_SIZE));
+  const page = Math.min(Math.max(0, Math.floor(requestedPage) || 0), pages - 1);
+  if (entries.length === 0) {
+    return { page: 0, text: "当前没有生效中的授权。", reply_markup: { inline_keyboard: [] } };
+  }
+  const slice = entries.slice(page * GRANTS_PAGE_SIZE, (page + 1) * GRANTS_PAGE_SIZE);
+  const rows: TelegramInlineKeyboard["inline_keyboard"] = [];
+  const texts = slice.map((entry, index) => {
+    const number = page * GRANTS_PAGE_SIZE + index + 1;
+    const all = `ga:${page}:${entry.approval_id}`;
+    const inline = `gi:${page}:${entry.approval_id}`;
+    // Approval ids are request UUIDs, well inside callback_data's 64 bytes; an
+    // id that somehow is not simply gets no buttons rather than breaking the page.
+    if (byteLength(inline) <= 64) {
+      rows.push([
+        ...(entry.inline_expires_at ? [{ text: `#${number} 只撤内联权限`, callback_data: inline }] : []),
+        { text: `❌ #${number} 全部吊销`, callback_data: all },
+      ]);
+    }
+    return grantEntryText(entry, number);
+  });
+  const nav: Array<{ text: string; callback_data: string }> = [];
+  if (page > 0) nav.push({ text: "◀️ 上一页", callback_data: `gp:${page - 1}` });
+  if (page < pages - 1) nav.push({ text: "下一页 ▶️", callback_data: `gp:${page + 1}` });
+  if (nav.length) rows.push(nav);
+  const text = [
+    `🔑 生效中的授权：${entries.length} 条（第 ${page + 1}/${pages} 页，最早到期在前）`,
+    "",
+    texts.join("\n\n"),
+  ].join("\n");
+  return { page, text: limit(text, TELEGRAM_MESSAGE_LIMIT), reply_markup: { inline_keyboard: rows } };
 }
 
 // ---------------------------------------------------------------------------
@@ -311,14 +418,32 @@ export type TelegramInlineKeyboard = {
 };
 
 type ApprovalActionKey = "approve_1h" | "approve_8h" | "approve_7d" | "approve_30d" | "approve_once" | "deny";
-type ApprovalAction = { key: ApprovalActionKey; label: string; style: "primary" | "neutral" | "danger" };
+type ApprovalAction = {
+  key: ApprovalActionKey;
+  label: string;
+  style: "primary" | "neutral" | "warning" | "danger";
+};
 
 const DENY_ACTION: ApprovalAction = { key: "deny", label: "拒绝", style: "danger" };
 
-/** Inline shell only gets "this run" — no TTL button that would never write a grant. */
+/** Top line of every inline card: what a TTL button there hands out. */
+export const INLINE_GRANT_WARNING = "批准后，本仓库内任意内联代码可免审使用这些密钥（「批准本次执行」除外）";
+
+/**
+ * Inline code keeps "this run" as the first, default-looking choice. The TTL
+ * buttons mint inline permission — any inline code in this repo, not just the
+ * code on this card — so each label says so on its own face (ADR-0009).
+ */
 function approvalActions(inlineShell: boolean): ApprovalAction[] {
   if (inlineShell) {
-    return [{ key: "approve_once", label: "批准本次执行", style: "primary" }, DENY_ACTION];
+    return [
+      { key: "approve_once", label: "批准本次执行", style: "primary" },
+      { key: "approve_1h", label: "批准 1 小时（含任意内联代码）", style: "warning" },
+      { key: "approve_8h", label: "批准 8 小时（含任意内联代码）", style: "warning" },
+      { key: "approve_7d", label: "批准 7 天（含任意内联代码）", style: "warning" },
+      { key: "approve_30d", label: "批准 30 天（含任意内联代码）", style: "warning" },
+      DENY_ACTION,
+    ];
   }
   return [
     { key: "approve_1h", label: "批准 1 小时", style: "primary" },
@@ -332,11 +457,16 @@ function approvalActions(inlineShell: boolean): ApprovalAction[] {
 function actionEmoji(style: string): string {
   if (style === "danger") return "❌";
   if (style === "primary") return "✅";
+  if (style === "warning") return "⚠️";
   return "▶️";
 }
 
+function byteLength(value: string): number {
+  return new TextEncoder().encode(value).length;
+}
+
 function callbackData(value: string): string {
-  if (new TextEncoder().encode(value).length > 64) {
+  if (byteLength(value) > 64) {
     throw new Error(`Telegram callback_data exceeds 64 bytes: ${value.slice(0, 16)}…`);
   }
   return value;
@@ -344,26 +474,34 @@ function callbackData(value: string): string {
 
 function buttonRows(
   buttons: Array<{ text: string; callback_data: string }>,
+  perRow = 2,
 ): TelegramInlineKeyboard {
   const rows: TelegramInlineKeyboard["inline_keyboard"] = [];
-  for (let index = 0; index < buttons.length; index += 2) {
-    rows.push(buttons.slice(index, index + 2));
+  for (let index = 0; index < buttons.length; index += perRow) {
+    rows.push(buttons.slice(index, index + perRow));
   }
   return { inline_keyboard: rows };
 }
 
 export function buildApprovalKeyboard(card: ApprovalCard): TelegramInlineKeyboard {
+  // Inline labels carry their warning, which a half-width button would cut off.
   return buttonRows(approvalActions(card.inline_shell).map((action) => ({
     text: `${actionEmoji(action.style)} ${limit(action.label, 48)}`,
     callback_data: callbackData(`ap:${card.id}:${action.key}`),
-  })));
+  })), card.inline_shell ? 1 : 2);
 }
 
 export function buildSightingKeyboard(card: SightingCard): TelegramInlineKeyboard {
-  return buttonRows([{
-    text: `${actionEmoji("danger")} ${limit("立即吊销这套授权", 48)}`,
-    callback_data: callbackData(`rv:${card.id}`),
-  }]);
+  if (!card.inline_grant) {
+    return buttonRows([{
+      text: `${actionEmoji("danger")} ${limit("立即吊销这套授权", 48)}`,
+      callback_data: callbackData(`rv:${card.id}`),
+    }]);
+  }
+  return buttonRows([
+    { text: "只撤内联权限", callback_data: callbackData(`ri:${card.id}`) },
+    { text: `${actionEmoji("danger")} 全部吊销`, callback_data: callbackData(`rv:${card.id}`) },
+  ]);
 }
 
 // ---------------------------------------------------------------------------
@@ -380,7 +518,18 @@ type TelegramCallbackQuery = {
   data?: unknown;
 };
 
-type TelegramUpdate = { update_id?: unknown; callback_query?: TelegramCallbackQuery | null };
+type TelegramMessage = {
+  message_id?: unknown;
+  from?: { id?: unknown } | null;
+  chat?: { id?: unknown } | null;
+  text?: unknown;
+};
+
+type TelegramUpdate = {
+  update_id?: unknown;
+  callback_query?: TelegramCallbackQuery | null;
+  message?: TelegramMessage | null;
+};
 
 type PendingApproval = {
   resolve: (decision: ApprovalDecision) => void;
@@ -420,6 +569,12 @@ export type TelegramApproverHooks = {
    * be resolved (unknown/expired handle).
    */
   onRevoke: (sightingId: string) => Promise<number | null> | number | null;
+  /** Same handle, but clear only the inline permission of those grants. */
+  onRevokeInline?: (sightingId: string) => Promise<number | null> | number | null;
+  /** Live grants for /grants, one entry per approval, earliest expiry first. */
+  listGrants?: () => Promise<GrantListEntry[]> | GrantListEntry[];
+  /** Revoke what one approval currently holds: everything, or only its inline permission. */
+  revokeApproval?: (approvalId: string, scope: "all" | "inline") => Promise<number> | number;
 };
 
 export type TelegramApproverDeps = {
@@ -684,13 +839,20 @@ export class TelegramApprover implements Approver {
       // The revoke button carries only the card id; the id → grant-keys
       // mapping lives in the durable store behind hooks.onRevoke, so the
       // button survives broker restarts.
-      await this.api("sendMessage", {
-        chat_id: this.chatId,
-        text: buildSightingText(card),
-        parse_mode: "HTML",
-        disable_web_page_preview: true,
-        reply_markup: buildSightingKeyboard(card),
-      });
+      //
+      // Silent: nothing waits on a Sighting. Only cards that need a tap to
+      // proceed may ring, or the ones that do get drowned out.
+      const texts = buildSightingMessages(card);
+      for (let index = 0; index < texts.length; index++) {
+        await this.api("sendMessage", {
+          chat_id: this.chatId,
+          text: texts[index],
+          parse_mode: "HTML",
+          disable_web_page_preview: true,
+          disable_notification: true,
+          ...(index === texts.length - 1 ? { reply_markup: buildSightingKeyboard(card) } : {}),
+        });
+      }
     } catch (error) {
       // Best-effort by contract: a Sighting never blocks an execution.
       this.log(`telegram sighting notification failed: ${errorMessage(error)}`);
@@ -710,6 +872,7 @@ export class TelegramApprover implements Approver {
         for (const update of updates ?? []) {
           if (typeof update.update_id === "number") this.offset = update.update_id + 1;
           if (update.callback_query) await this.handleCallback(update.callback_query);
+          else if (update.message) await this.handleMessage(update.message);
         }
       } catch (error) {
         if (controller.signal.aborted) return;
@@ -731,9 +894,89 @@ export class TelegramApprover implements Approver {
     } else if (data.startsWith("wr:")) {
       await this.handleWriteCallback(data, callbackId, fromId, callback);
     } else if (data.startsWith("rv:")) {
-      await this.handleRevokeCallback(data.slice(3), callbackId, fromId, callback);
+      await this.handleRevokeCallback(data.slice(3), "all", callbackId, fromId, callback);
+    } else if (data.startsWith("ri:")) {
+      await this.handleRevokeCallback(data.slice(3), "inline", callbackId, fromId, callback);
+    } else if (data.startsWith("gp:") || data.startsWith("ga:") || data.startsWith("gi:")) {
+      await this.handleGrantsCallback(data, callbackId, fromId, callback);
     }
-    // Anything else (plain messages, unknown callbacks) is ignored.
+    // Anything else (unknown callbacks) is ignored.
+  }
+
+  /**
+   * Plain messages: only `/grants` means anything, and only from the Owner in
+   * the configured chat — the bot may sit in other chats, and a listing of
+   * what is granted where is itself worth keeping to the Owner.
+   */
+  private async handleMessage(message: TelegramMessage): Promise<void> {
+    const text = typeof message.text === "string" ? message.text.trim() : "";
+    if (!/^\/grants(@[A-Za-z0-9_]+)?(\s|$)/.test(text)) return;
+    const fromId = typeof message.from?.id === "number" ? message.from.id : NaN;
+    if (String(message.chat?.id ?? "") !== this.chatId || !this.allowedUserIds.includes(fromId)) return;
+    if (!this.hooks.listGrants) return;
+    try {
+      const view = buildGrantsPage(await this.hooks.listGrants(), 0);
+      await this.api("sendMessage", {
+        chat_id: this.chatId,
+        text: view.text,
+        disable_web_page_preview: true,
+        disable_notification: true,
+        reply_markup: view.reply_markup,
+      });
+    } catch (error) {
+      this.log(`telegram /grants failed: ${errorMessage(error)}`);
+    }
+  }
+
+  private async handleGrantsCallback(
+    data: string,
+    callbackId: string,
+    fromId: number,
+    callback: TelegramCallbackQuery,
+  ): Promise<void> {
+    if (!this.allowedUserIds.includes(fromId)) {
+      await this.answerCallback(callbackId, "无权操作");
+      return;
+    }
+    const match = /^(gp|ga|gi):(\d{1,4})(?::([A-Za-z0-9_-]{8,80}))?$/.exec(data);
+    const [, action, pageText, approvalId] = match ?? [];
+    if (!match || (action === "gp") !== (approvalId === undefined) || !this.hooks.listGrants) {
+      await this.answerCallback(callbackId, "未知操作");
+      return;
+    }
+    let toast = "";
+    if (action !== "gp") {
+      if (!this.hooks.revokeApproval) {
+        await this.answerCallback(callbackId, "未知操作");
+        return;
+      }
+      try {
+        const changed = await this.hooks.revokeApproval(approvalId!, action === "gi" ? "inline" : "all");
+        toast = action === "gi" ? `已撤销 ${changed} 行的内联权限` : `已吊销 ${changed} 行`;
+      } catch (error) {
+        this.log(`telegram grant revoke failed: ${errorMessage(error)}`);
+        await this.answerCallback(callbackId, "吊销失败，请检查服务端日志");
+        return;
+      }
+    }
+    await this.answerCallback(callbackId, toast);
+    // Re-render in place: paging needs no push, and after a revoke the Owner
+    // should see the listing as it now stands, not as it was.
+    const messageId = callback.message?.message_id;
+    const chatId = callback.message?.chat?.id;
+    if (messageId === undefined || messageId === null || chatId === undefined || chatId === null) return;
+    try {
+      const view = buildGrantsPage(await this.hooks.listGrants(), Number(pageText));
+      await this.api("editMessageText", {
+        chat_id: chatId,
+        message_id: messageId,
+        text: view.text,
+        disable_web_page_preview: true,
+        reply_markup: view.reply_markup,
+      });
+    } catch (error) {
+      this.log(`telegram /grants refresh failed: ${errorMessage(error)}`);
+    }
   }
 
   private async handleApprovalCallback(
@@ -805,6 +1048,7 @@ export class TelegramApprover implements Approver {
 
   private async handleRevokeCallback(
     cardId: string,
+    scope: "all" | "inline",
     callbackId: string,
     fromId: number,
     callback: TelegramCallbackQuery,
@@ -813,9 +1057,14 @@ export class TelegramApprover implements Approver {
       await this.answerCallback(callbackId, "无权审批");
       return;
     }
+    const hook = scope === "inline" ? this.hooks.onRevokeInline : this.hooks.onRevoke;
+    if (!hook) {
+      await this.answerCallback(callbackId, "未知操作");
+      return;
+    }
     let removed: number | null = null;
     try {
-      removed = await this.hooks.onRevoke(cardId);
+      removed = await hook(cardId);
     } catch (error) {
       this.log(`telegram revoke hook failed: ${errorMessage(error)}`);
       await this.answerCallback(callbackId, "吊销失败，请检查服务端日志");
@@ -825,6 +1074,16 @@ export class TelegramApprover implements Approver {
       // Honest answer: the handle cannot be resolved (e.g. pre-dates the
       // durable store or was swept) — never claim the grants are gone.
       await this.answerCallback(callbackId, "无法识别该通知，未吊销任何授权；请手动检查");
+      return;
+    }
+    if (scope === "inline") {
+      // The ordinary part is still live, so the full-revoke button must stay
+      // usable; only the now-meaningless inline button goes.
+      await this.answerCallback(callbackId, `已撤销 ${removed} 行的内联权限`);
+      await this.replaceKeyboard(callback, buttonRows([{
+        text: `${actionEmoji("danger")} 全部吊销`,
+        callback_data: callbackData(`rv:${cardId}`),
+      }]));
       return;
     }
     await this.answerCallback(callbackId, `已吊销 ${removed} 行`);
@@ -866,6 +1125,10 @@ export class TelegramApprover implements Approver {
 
   /** Best-effort: strip the keyboard after a decision so buttons cannot be re-pressed. */
   private async removeKeyboard(callback: TelegramCallbackQuery): Promise<void> {
+    await this.replaceKeyboard(callback, { inline_keyboard: [] });
+  }
+
+  private async replaceKeyboard(callback: TelegramCallbackQuery, markup: TelegramInlineKeyboard): Promise<void> {
     const messageId = callback.message?.message_id;
     const chatId = callback.message?.chat?.id;
     if (messageId === undefined || messageId === null || chatId === undefined || chatId === null) return;
@@ -873,7 +1136,7 @@ export class TelegramApprover implements Approver {
       await this.api("editMessageReplyMarkup", {
         chat_id: chatId,
         message_id: messageId,
-        reply_markup: { inline_keyboard: [] },
+        reply_markup: markup,
       });
     } catch (error) {
       this.log(`telegram editMessageReplyMarkup failed: ${errorMessage(error)}`);
@@ -896,9 +1159,9 @@ function decisionForAction(
     decided_by: String(fromId),
     decided_at: decidedAt,
   });
-  // Inline-shell cards only ever offered approve_once; a forged TTL callback
-  // must not mint a grant (and vice versa).
-  if (inlineShell) return actionKey === "approve_once" ? approve("once") : null;
+  // "once" exists only on inline cards; an ordinary card never offered it, so
+  // a forged approve_once there is refused rather than silently widened.
+  if (actionKey === "approve_once") return inlineShell ? approve("once") : null;
   if (actionKey.startsWith("approve_")) {
     const ttl = actionKey.slice("approve_".length);
     if (isSecretGrantTtl(ttl)) return approve(ttl);
