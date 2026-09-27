@@ -8,7 +8,7 @@ import { createAutoApprover } from "./approver_auto.ts";
 import { TelegramApprover } from "./approver_telegram.ts";
 import { ClientRegistry } from "./clients.ts";
 import { loadConfig } from "./config.ts";
-import { GrantStore } from "./grants.ts";
+import { GrantStore, listGrantEntries } from "./grants.ts";
 import { startHttpServer } from "./http.ts";
 import { RequestBroker } from "./requests.ts";
 import { WriteBroker } from "./writes.ts";
@@ -58,7 +58,13 @@ async function main(): Promise<void> {
         allowedUserIds: config.telegram_allowed_user_ids,
         approvalCards: config.approval_cards,
       },
-      { onRevoke: (sightingId) => grants.revokeByHandle(sightingId) },
+      {
+        onRevoke: (sightingId) => grants.revokeByHandle(sightingId),
+        onRevokeInline: (sightingId) => grants.revokeInlineByHandle(sightingId),
+        listGrants: () => listGrantEntries(grants, () => vault.itemNames(), log),
+        revokeApproval: (approvalId, scope) =>
+          scope === "inline" ? grants.revokeApprovalInline(approvalId) : grants.revokeApproval(approvalId),
+      },
       { log },
     );
   }

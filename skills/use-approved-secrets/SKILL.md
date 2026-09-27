@@ -110,10 +110,14 @@ full argv and a revoke button. Execution is not delayed by it.
 ### Inline shell
 
 Inline code (`sh -c`, `bash -lc`, `python -c`, …) is allowed and passed through verbatim.
-It is approved **every single time** and never writes a reusable authorization, because
-the whole code string is what the Owner is being asked to judge. Prefer it over a
-throwaway script file when you need a pipeline — the inline string is visible on the
-card, a script file's contents are not.
+Prefer it over a throwaway script file when you need a pipeline — the inline string is
+visible on the card, a script file's contents are not.
+
+An ordinary authorization never covers inline code. The Owner decides on the card:
+"this run only", or a period during which any inline code in this repository may use
+those items. If they chose a period, re-running (the same or different inline code) takes
+the fast path like any other command; if they chose "this run only", every run asks
+again. `exec` says which happened — do not assume either.
 
 ## Writing
 

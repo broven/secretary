@@ -138,7 +138,7 @@ describe("Linux user config store", () => {
       const output: string[] = [];
       const deps: ClientDeps = {
         env,
-        fetch: (async () => Response.json({ items: [] })) as unknown as typeof fetch,
+        fetch: (async () => Response.json({ items: [] })) as ClientDeps["fetch"],
         keychain: createLinuxConfigStore(env, async () => "file-token"),
         platform: "linux",
         realpath: (async (path) => String(path)) as ClientDeps["realpath"],

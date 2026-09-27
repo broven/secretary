@@ -87,6 +87,7 @@ export function makeLiveVault(secrets: { username: string; password: string }): 
     name: LIVE_ITEM_NAME,
     description: "secretary live Telegram test item (in-memory only)",
     fields: ["username", "password"],
+    how_to_get: "",
   };
   const values = new Map<string, string>([
     [valueKey(LIVE_ITEM_ID, "username"), secrets.username],
@@ -96,7 +97,13 @@ export function makeLiveVault(secrets: { username: string; password: string }): 
     async catalog(query = "") {
       const normalized = query.trim().toLowerCase();
       return (!normalized || item.name.toLowerCase().includes(normalized))
-        ? [{ name: item.name, description: item.description, fields: item.fields, created_at: item.created_at }]
+        ? [{
+          name: item.name,
+          description: item.description,
+          fields: item.fields,
+          created_at: item.created_at,
+          how_to_get: item.how_to_get,
+        }]
         : [];
     },
     async resolveByName(names: string[]) {

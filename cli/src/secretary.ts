@@ -119,7 +119,7 @@ export type ClientKeyExchange = { privateKey: CryptoKey; publicKeyJwk: JsonWebKe
 
 const CREDENTIAL_ENVELOPE_INFO = new TextEncoder().encode("secretary:credential-envelope:v1");
 
-function credentialEnvelopeAad(requestId: string): Uint8Array {
+function credentialEnvelopeAad(requestId: string): Uint8Array<ArrayBuffer> {
   const id = requestId.toLowerCase();
   if (!UUID.test(id)) throw new Error("request_id 无效");
   return new TextEncoder().encode(`secretary:credential-envelope:v1\nrequest_id=${id}`);
@@ -136,10 +136,13 @@ export type ClientPlatform = "darwin" | "linux" | "unsupported";
 
 export type ClientDeps = {
   env: Record<string, string | undefined>;
-  fetch: typeof fetch;
+  /** Only the call shape the CLI uses — not the full runtime `fetch`, whose
+   * extra members (e.g. Bun's `preconnect`) no test double needs to fake. */
+  fetch: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
   keychain: Keychain;
   platform?: ClientPlatform;
-  realpath: typeof realpath;
+  /** Canonical path of a directory; the string overload is the only one used. */
+  realpath: (path: string) => Promise<string>;
   stat: typeof stat;
   now: () => number;
   randomUUID: () => string;
@@ -485,7 +488,7 @@ export function parseCatalogResponse(value: unknown): CatalogResponse {
   return { items };
 }
 
-function fromBase64Url(value: string, maximumBytes: number): Uint8Array {
+function fromBase64Url(value: string, maximumBytes: number): Uint8Array<ArrayBuffer> {
   if (!/^[A-Za-z0-9_-]+$/.test(value) || value.length > Math.ceil(maximumBytes * 4 / 3) + 4) {
     throw new Error("凭证密文格式无效");
   }

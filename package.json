@@ -3,6 +3,11 @@
   "private": true,
   "workspaces": ["server", "cli"],
   "scripts": {
-    "test": "bun test"
+    "test": "bun test",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "devDependencies": {
+    "bun-types": "^1.3.0",
+    "typescript": "^5"
   }
 }

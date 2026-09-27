@@ -51,9 +51,13 @@ function reserveLoopbackPort(): PortReservation {
     port: 0,
     fetch: () => new Response("reserved"),
   });
+  // Bun types `port` as optional because a unix-socket server has none; this
+  // one listens on TCP, so a missing port is a genuine failure.
+  const port = server.port;
+  if (port === undefined) throw new Error("loopback reservation has no port");
   let active = true;
   return {
-    port: server.port,
+    port,
     release: () => {
       if (!active) return;
       active = false;

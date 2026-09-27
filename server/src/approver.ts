@@ -36,6 +36,10 @@ export type SightingCard = {
   id: string;
   reason: string;
   command: string;
+  /** The command is inline code: the card must show all of it. */
+  inline_shell: boolean;
+  /** Some of these grants carry inline permission, so "revoke only that" is offered. */
+  inline_grant: boolean;
   items: ApprovalCardItem[];
   repo: string;
   host: string;
@@ -46,6 +50,19 @@ export type SightingCard = {
   expires_at: string;
   /** Grant rows the revoke button deletes. */
   grant_keys: string[];
+};
+
+/** One entry of the Owner's grant listing: one approval as it stands now. */
+export type GrantListEntry = {
+  approval_id: string;
+  repo: string;
+  client_name: string;
+  /** Item display names (best effort — falls back to the item id) with their Fields. */
+  items: Array<{ name: string; fields: string[] }>;
+  /** Earliest live ordinary expiry, ISO; absent when none is live. */
+  expires_at?: string;
+  /** Earliest live inline expiry, ISO; absent when none is live. */
+  inline_expires_at?: string;
 };
 
 export interface Approver extends WriteApprover {

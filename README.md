@@ -35,11 +35,14 @@ time-limited grants**:
 - **Grants are narrow and expire.** Keyed by (caller, client, repo, item,
   field) with TTLs of 1h / 8h / 7d / 30d. The same secret in a different repo needs
   its own approval.
-- **Inline code never earns trust.** `sh -c`, `python -c`, `node -e` (and
-  their combined-flag and `env`-wrapped variants) always require approval and
-  never create a Grant.
+- **Inline code earns trust only on its own terms.** `sh -c`, `python -c`,
+  `node -e` (and their combined-flag and `env`-wrapped variants) are never
+  covered by an ordinary Grant. The card offers "this run only" first; its
+  time-limited buttons say plainly that they cover *any* inline code in that
+  repo, and that inline permission can be revoked on its own.
 - **You stay informed.** The first sighting of a new command under an
-  existing Grant sends a non-blocking notification with a one-tap revoke.
+  existing Grant sends a silent notification with the full command and a
+  one-tap revoke; `/grants` in the bot chat lists everything live.
 - **Secrets stay sealed.** Envelope encryption (ephemeral P-256 ECDH +
   HKDF-SHA256 + AES-256-GCM) means TLS terminators, tunnels, and proxies
   between broker and CLI never see plaintext. Nothing is persisted server-side

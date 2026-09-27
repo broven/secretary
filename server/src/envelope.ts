@@ -8,7 +8,7 @@ import { UUID } from "./types.ts";
 
 const ENVELOPE_INFO = new TextEncoder().encode("secretary:credential-envelope:v1");
 
-export function credentialEnvelopeAad(requestId: string): Uint8Array {
+export function credentialEnvelopeAad(requestId: string): Uint8Array<ArrayBuffer> {
   const id = requestId.toLowerCase();
   if (!UUID.test(id)) throw new Error("request_id invalid");
   return new TextEncoder().encode(`secretary:credential-envelope:v1\nrequest_id=${id}`);
@@ -18,7 +18,7 @@ function toBase64Url(value: Uint8Array): string {
   return Buffer.from(value).toString("base64url");
 }
 
-function fromBase64Url(value: string, maximumBytes: number): Uint8Array {
+function fromBase64Url(value: string, maximumBytes: number): Uint8Array<ArrayBuffer> {
   if (!/^[A-Za-z0-9_-]+$/.test(value) || value.length > Math.ceil(maximumBytes * 4 / 3) + 4) {
     throw new Error("credential envelope format invalid");
   }
