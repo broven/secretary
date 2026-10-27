@@ -3,10 +3,10 @@
 // point; these tests only cover argument parsing and the fake vault seeding.
 
 import { describe, expect, test } from "bun:test";
-import { LIVE_ITEM_ID, LIVE_ITEM_NAME, makeLiveVault, parseLiveTestArgs } from "./live_test.ts";
+import { LIVE_ITEM_ID, LIVE_ITEM_NAME, makeLiveVault, parseLiveTestArgs } from "./live.ts";
 import { valueKey } from "../server/src/vault.ts";
 
-describe("live_test harness", () => {
+describe("live harness", () => {
   test("argument parsing", () => {
     expect(parseLiveTestArgs([])).toEqual({ startStep: 1 });
     expect(parseLiveTestArgs(["--step", "3"])).toEqual({ startStep: 3 });

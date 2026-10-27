@@ -1,6 +1,13 @@
 #!/usr/bin/env bun
 // Phase A live Telegram test harness (PLAN.md 修订 1 / A).
 //
+// Deliberately NOT named `live_test.ts`: `bun test` collects `*_test.ts` and
+// would run this file's `main()` — which calls `process.exit(2)` when the
+// Telegram credentials are absent — turning a manual harness into a CI failure.
+// The `import.meta.main` guard below is not enough, because bun loads every
+// collected file as a test module. `live.test.ts` holds the unit-testable
+// pieces.
+//
 // Drives the REAL broker components (grants, clients, envelope, HTTP API, and
 // the real TelegramApprover long-polling api.telegram.org with the test bot)
 // plus the real compiled CLI, end to end, while the Owner taps real buttons on
@@ -15,9 +22,9 @@
 //     exec --reason "secretary Phase A: live Telegram approval test with the playground bot" \
 //     --item "telegram playground" password=TG_TEST_BOT_TOKEN \
 //     --item "telegram-userid" username=TG_OWNER_CHAT_ID \
-//     -- bun run deploy/live_test.ts
+//     -- bun run deploy/live.ts
 //
-// Optional: `-- bun run deploy/live_test.ts --step N` resumes from step N
+// Optional: `-- bun run deploy/live.ts --step N` resumes from step N
 // (earlier steps' state — e.g. the 1h grant from step 1 — must still exist on
 // the Telegram/grant side for later steps to make sense; the SQLite store is
 // temp per run, so resuming mainly helps re-running a failed later step
@@ -72,7 +79,7 @@ export function parseLiveTestArgs(argv: string[]): { startStep: number } {
       }
       startStep = value;
     } else {
-      throw new Error(`unknown argument: ${argv[index]} (usage: live_test.ts [--step N])`);
+      throw new Error(`unknown argument: ${argv[index]} (usage: live.ts [--step N])`);
     }
   }
   return { startStep };
@@ -191,7 +198,7 @@ async function main(): Promise<void> {
       '[live]   approved-secret exec --reason "..." \\\n' +
       '[live]     --item "telegram playground" password=TG_TEST_BOT_TOKEN \\\n' +
       '[live]     --item "telegram-userid" username=TG_OWNER_CHAT_ID \\\n' +
-      "[live]     -- bun run deploy/live_test.ts",
+      "[live]     -- bun run deploy/live.ts",
     );
     process.exit(2);
   }

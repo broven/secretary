@@ -27,6 +27,20 @@ An Item is one vault entry (matched by exact name); a Field is one credential
 inside it (password, username, a custom field). Requests name Items and map Fields
 to environment variable names (aliases).
 
+An Item belongs either to an Organization (through one or more Collections) or
+to the vault account's personal space. See Vault placement.
+
+## Vault placement
+
+Where a newly created Item lands: an Organization plus one Collection, from
+`VAULT_ORG_ID` / `VAULT_COLLECTION_ID`. Placement is not cosmetic — a personal
+Item is readable by its account alone, and not by an Organization that account
+belongs to, so an agent's Item filed personally is invisible to the Owner's own
+vault account. Unset placement means the personal space, which is correct only
+when the Broker's account and the Owner's are the same. With a placement set, a
+write that would touch a still-personal Item is refused rather than applied:
+the vault is where the Owner looks, and half-placed Items make it lie.
+
 ## Request
 
 One attempt by a Client to run a command with secrets: the tuple of caller

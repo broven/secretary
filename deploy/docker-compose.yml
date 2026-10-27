@@ -29,6 +29,12 @@ services:
       # Extra CA bundle for a self-signed/internal vaultwarden cert (optional).
       # NODE_EXTRA_CA_CERTS: /vw-tls/cert.pem
       BW_EMAIL: ${BW_EMAIL}
+      # Where newly created Items are filed. Unset (both) means the vault
+      # account's personal space: only that account can see them, which is
+      # fine for a single-account vault and a trap for any other. Set both to
+      # give the Owner's own account visibility of what agents store.
+      VAULT_ORG_ID: ${VAULT_ORG_ID:-}
+      VAULT_COLLECTION_ID: ${VAULT_COLLECTION_ID:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
       TELEGRAM_ALLOWED_USER_IDS: ${TELEGRAM_ALLOWED_USER_IDS}
       # Optional tuning; empty means the broker defaults (300 / 60 / 600).
@@ -62,7 +68,13 @@ services:
       retries: 3
 
   vaultwarden:
-    image: vaultwarden/server:latest
+    # Pinned, not `latest`. This is the vault the Owner's passwords live in, and
+    # 1.37.4 removed endpoints that clients still shipped in the field
+    # (`POST /identity/accounts/register`, `POST /api/accounts/prelogin`); an
+    # unattended `pull` should never be what moves production across a change
+    # like that. Bump this deliberately, with the vault backed up first — see
+    # the upgrade notes in README.md.
+    image: vaultwarden/server:1.37.4
     profiles: ["vaultwarden"]
     restart: unless-stopped
     volumes:

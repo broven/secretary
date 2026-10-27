@@ -211,7 +211,7 @@ Contributor setup and the complete local task loop are documented in
 bun test                                   # unit + integration (fake vault/Telegram)
 INTEGRATION_REAL_BW=1 bun test server/test/real_bw.test.ts   # real vaultwarden + bw
 bun run deploy/smoke.ts                    # full compose e2e smoke
-bun run deploy/live_test.ts                # guided live test against real Telegram
+bun run deploy/live.ts                # guided live test against real Telegram
 ```
 
 The integration suite drives the real broker against a fake Telegram server

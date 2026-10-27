@@ -114,6 +114,24 @@ cloudflared, Tailscale, …) in front of the loopback port; only switch the
 compose mapping to `0.0.0.0:8787:8787` if you consciously terminate TLS
 elsewhere on the same host boundary.
 
+### Upgrading the bundled vaultwarden
+
+The image tag is pinned in `docker-compose.yml` on purpose — see the comment
+there. To move to a newer release, back the volume up first and verify after:
+
+```sh
+docker run --rm -v <project>_vw-data:/data -v "$PWD":/backup alpine \
+  tar czf /backup/vw-data-$(date +%Y%m%d-%H%M%S).tar.gz -C /data .
+# then bump the image tag, and:
+docker compose --profile vaultwarden up -d
+curl -fsS https://<vault-url>/api/config >/dev/null && echo alive
+```
+
+Check the release notes for endpoint removals before bumping: 1.37.4 dropped
+two legacy routes that older `bw` builds still call, so a broker whose baked-in
+CLI is older than the vault it talks to starts failing at login, not at the
+call site.
+
 ## 5. Issue a client token
 
 Each agent machine gets its own client identity:
@@ -143,6 +161,30 @@ By hand:
      mode `0700` and file mode `0600`.
    - CI or other automated runs: export `SECRETARY_URL`, `SECRETARY_TOKEN` and
      optional `SECRETARY_CLIENT_ID`; environment variables override platform storage.
+
+### Item ownership (who can see what the broker writes)
+
+Every Item the broker creates is filed by `bw` in the **vault account's personal
+space** unless the deployment says otherwise, and a personal Item is visible to
+that account only — not to an organization the account belongs to, however
+privileged. If the Owner logs into the vault with their own account while the
+broker runs as a dedicated automation account, everything the agents stored is
+invisible to them.
+
+Set both ids to file new Items into an organization collection instead:
+
+```sh
+# vault web UI → that collection → the URL contains both ids
+VAULT_ORG_ID=<organization uuid>
+VAULT_COLLECTION_ID=<collection uuid>
+```
+
+The automation account needs **write** access to that collection (Vaultwarden
+collection permissions: not read-only); collection management is not required.
+With the pair set, the broker also refuses to add Fields to Items that are
+still personal rather than quietly extending the problem — move those first
+(`bw move <item-id> <org-id> <encoded collection ids>` from the automation
+account, or drag them in the web UI).
 
 ## 7. Smoke test
 

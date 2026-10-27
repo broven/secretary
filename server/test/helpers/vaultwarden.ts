@@ -84,13 +84,28 @@ async function generateAccountKeys(userKey: Buffer): Promise<{ publicKey: string
 /**
  * Register a new account directly against vaultwarden's API, reimplementing
  * the Bitwarden client registration crypto (kdf 0 / PBKDF2 600k).
+ *
+ * Works against both registration flows, because the test vault is meant to be
+ * whatever image the deployment would run rather than one pinned to a version
+ * that happens to suit this helper:
+ *
+ * - **Two-step** (vaultwarden ≥ 1.37.4, matching current Bitwarden clients):
+ *   ask `…/accounts/register/send-verification-email` for a token, then post
+ *   `RegisterData` to `…/accounts/register/finish` carrying it as
+ *   `emailVerificationToken`.
+ * - **One-step** (≤ 1.37.3): post `RegisterData` straight to
+ *   `…/accounts/register`.
+ *
+ * The legacy endpoint was removed in 1.37.4 ("No current client uses them"),
+ * so detecting it by 404 is the only portable option: there is no version
+ * endpoint that predates the change.
  */
 export async function registerVaultwardenAccount(
   baseUrl: string,
   email: string,
   password: string,
   opts: FetchOpts = {},
-): Promise<void> {
+): Promise<{ userKey: Buffer; publicKey: string }> {
   const doFetch = opts.fetchImpl ?? fetch;
   const masterKey = deriveMasterKey(email, password);
   const masterPasswordHash = deriveMasterPasswordHash(masterKey, password);
@@ -99,7 +114,14 @@ export async function registerVaultwardenAccount(
   const protectedUserKey = encStringType2(encKey, macKey, userKey);
   const keys = await generateAccountKeys(userKey);
 
-  const body = JSON.stringify({
+  const postJson = (path: string, body: string, extraHeaders: Record<string, string> = {}) =>
+    doFetch(`${baseUrl}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...extraHeaders },
+      body,
+    });
+
+  const registerData = (emailVerificationToken?: string) => JSON.stringify({
     name: "secretary-test",
     email,
     masterPasswordHash,
@@ -108,15 +130,133 @@ export async function registerVaultwardenAccount(
     kdf: 0,
     kdfIterations: KDF_ITERATIONS,
     keys,
+    ...(emailVerificationToken ? { emailVerificationToken } : {}),
   });
-  const post = (path: string) =>
-    doFetch(`${baseUrl}${path}`, { method: "POST", headers: { "Content-Type": "application/json" }, body });
 
-  let response = await post("/identity/accounts/register");
-  if (response.status === 404) response = await post("/api/accounts/register");
-  if (!response.ok) {
-    throw new Error(`vaultwarden register failed (${response.status}): ${await response.text()}`);
+  // One-step flow first: it is what every release before 1.37.4 accepted, and
+  // a 404 is an unambiguous "this server no longer has that endpoint".
+  const oneStep = await postJson("/identity/accounts/register", registerData());
+  if (oneStep.ok) return { userKey, publicKey: keys.publicKey };
+  if (oneStep.status !== 404) {
+    throw new Error(`vaultwarden register failed (${oneStep.status}): ${await oneStep.text()}`);
   }
+
+  // Two-step flow. `Accept: application/json` asks for the token in the body;
+  // without it the server hands back the token as plain text for the web vault.
+  const verification = await postJson(
+    "/identity/accounts/register/send-verification-email",
+    JSON.stringify({ email, name: "secretary-test" }),
+    { Accept: "application/json" },
+  );
+  if (!verification.ok) {
+    throw new Error(
+      `vaultwarden send-verification-email failed (${verification.status}): ${await verification.text()}`,
+    );
+  }
+  const verificationText = await verification.text();
+  // 204 means the server sent a real email instead of returning the token, which
+  // this harness cannot read — the test container runs with mail disabled.
+  if (verification.status === 204 || !verificationText) {
+    throw new Error(
+      "vaultwarden answers registration with an email; this harness needs a vault with " +
+        "signups_verify off (the throwaway container has mail disabled)",
+    );
+  }
+  const token = JSON.parse(verificationText) as string;
+  const finish = await postJson("/identity/accounts/register/finish", registerData(token));
+  if (!finish.ok) {
+    throw new Error(`vaultwarden register finish failed (${finish.status}): ${await finish.text()}`);
+  }
+  return { userKey, publicKey: keys.publicKey };
+}
+
+/**
+ * Create an Organization with one Collection, owned by the account behind
+ * `accessToken`.
+ *
+ * A Collection has to carry real key material or nothing can be encrypted to
+ * it, so this reproduces what a client does: generate an org key pair, wrap
+ * the org private key with a fresh 64-byte org symmetric key, hand the creator
+ * that symmetric key RSA-encrypted to their own public key (the `key` field),
+ * and then symmetric-encrypt it with the creator's user key for transport.
+ *
+ * Returns the ids the Broker takes as `VAULT_ORG_ID` / `VAULT_COLLECTION_ID`.
+ */
+export async function createOrganizationWithCollection(opts: {
+  baseUrl: string;
+  accessToken: string;
+  /** From `registerVaultwardenAccount`: the creator's own key material. */
+  userKey: Buffer;
+  userPublicKey: string;
+  name: string;
+  collectionName: string;
+  fetchImpl?: typeof fetch;
+}): Promise<{ organization_id: string; collection_id: string }> {
+  const doFetch = opts.fetchImpl ?? fetch;
+  const auth = { Authorization: `Bearer ${opts.accessToken}` };
+
+  const orgPair = await crypto.subtle.generateKey(
+    { name: "RSA-OAEP", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-1" },
+    true,
+    ["encrypt", "decrypt"],
+  );
+  const orgPublicKey = b64(new Uint8Array(await crypto.subtle.exportKey("spki", orgPair.publicKey)));
+  const orgPrivateKey = new Uint8Array(await crypto.subtle.exportKey("pkcs8", orgPair.privateKey));
+  const orgKey = randomBytes(64);
+
+  // Type 4 = RSA-2048 OAEP-SHA1, a single base64 part. This is what the server
+  // stores as the member's encrypted org key (`akey`), and the client unwraps
+  // it with its own RSA private key — so it is NOT wrapped in a symmetric layer.
+  const orgKeyForCreator = await crypto.subtle.encrypt(
+    { name: "RSA-OAEP" },
+    await crypto.subtle.importKey(
+      "spki",
+      Buffer.from(opts.userPublicKey, "base64"),
+      { name: "RSA-OAEP", hash: "SHA-1" },
+      false,
+      ["encrypt"],
+    ),
+    orgKey,
+  );
+  const orgKeyRsa = `4.${b64(new Uint8Array(orgKeyForCreator))}`;
+
+  const response = await doFetch(`${opts.baseUrl}/api/organizations`, {
+    method: "POST",
+    headers: { ...auth, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      billingEmail: "owner@example.com",
+      collectionName: opts.collectionName,
+      key: orgKeyRsa,
+      name: opts.name,
+      keys: {
+        encryptedPrivateKey: encStringType2(orgKey.subarray(0, 32), orgKey.subarray(32, 64), orgPrivateKey),
+        publicKey: orgPublicKey,
+      },
+      planType: 0,
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(`organization create failed (${response.status}): ${await response.text()}`);
+  }
+  const org = (await response.json()) as { id?: string; Id?: string };
+  const organizationId = org.id ?? org.Id;
+  if (!organizationId) throw new Error("organization create returned no id");
+
+  const collectionsResponse = await doFetch(`${opts.baseUrl}/api/organizations/${organizationId}/collections`, {
+    headers: auth,
+  });
+  if (!collectionsResponse.ok) {
+    throw new Error(`collection list failed (${collectionsResponse.status}): ${await collectionsResponse.text()}`);
+  }
+  const payload = (await collectionsResponse.json()) as
+    | Array<{ id?: string; Id?: string; name?: string; Name?: string }>
+    | { data?: Array<{ id?: string; Id?: string; name?: string; Name?: string }> };
+  const collections = Array.isArray(payload) ? payload : (payload.data ?? []);
+  const created =
+    collections.find((entry) => (entry.name ?? entry.Name) === opts.collectionName) ?? collections[0];
+  const collectionId = created?.id ?? created?.Id;
+  if (!collectionId) throw new Error("organization has no collection");
+  return { organization_id: organizationId, collection_id: collectionId };
 }
 
 /** Log in with the master password and mint a personal API key (client_id/client_secret). */
@@ -125,7 +265,7 @@ export async function obtainUserApiKey(
   email: string,
   password: string,
   opts: FetchOpts = {},
-): Promise<{ client_id: string; client_secret: string }> {
+): Promise<{ client_id: string; client_secret: string; access_token: string }> {
   const doFetch = opts.fetchImpl ?? fetch;
   const masterKey = deriveMasterKey(email, password);
   const masterPasswordHash = deriveMasterPasswordHash(masterKey, password);
@@ -175,7 +315,7 @@ export async function obtainUserApiKey(
   const clientSecret = apiKey.apiKey ?? apiKey.ApiKey;
   if (!clientSecret) throw new Error("vaultwarden api-key response has no apiKey");
 
-  return { client_id: `user.${userId}`, client_secret: clientSecret };
+  return { client_id: `user.${userId}`, client_secret: clientSecret, access_token: token.access_token };
 }
 
 async function runBwStep(
@@ -286,11 +426,17 @@ async function runOpenssl(args: string[]): Promise<void> {
  * self-signed certificate because modern bw CLI builds refuse plain-http
  * servers outright; `caFile` is the cert to trust (NODE_EXTRA_CA_CERTS for bw,
  * `fetchWithCa` for direct API calls).
+ *
+ * Defaults to `latest` on purpose: this harness exists to prove the Broker
+ * works against the server a deployment would actually pull, so pinning it here
+ * would only hide the next upstream removal behind a green test (which is
+ * exactly how the 1.37.4 registration change went unnoticed). Override with
+ * `INTEGRATION_VAULTWARDEN_IMAGE=...` to probe a specific release.
  */
 export async function startVaultwardenContainer(
   opts: { image?: string } = {},
 ): Promise<{ url: string; caFile: string; stop(): Promise<void> }> {
-  const image = opts.image ?? "vaultwarden/server:latest";
+  const image = opts.image ?? process.env.INTEGRATION_VAULTWARDEN_IMAGE ?? "vaultwarden/server:latest";
   // Under /tmp (not os.tmpdir()) so Docker Desktop's default file sharing can
   // bind-mount it into the container.
   const certDir = await mkdtemp("/tmp/secretary-vw-tls-");
