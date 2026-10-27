@@ -114,6 +114,24 @@ cloudflared, Tailscale, …) in front of the loopback port; only switch the
 compose mapping to `0.0.0.0:8787:8787` if you consciously terminate TLS
 elsewhere on the same host boundary.
 
+### Upgrading the bundled vaultwarden
+
+The image tag is pinned in `docker-compose.yml` on purpose — see the comment
+there. To move to a newer release, back the volume up first and verify after:
+
+```sh
+docker run --rm -v <project>_vw-data:/data -v "$PWD":/backup alpine \
+  tar czf /backup/vw-data-$(date +%Y%m%d-%H%M%S).tar.gz -C /data .
+# then bump the image tag, and:
+docker compose --profile vaultwarden up -d
+curl -fsS https://<vault-url>/api/config >/dev/null && echo alive
+```
+
+Check the release notes for endpoint removals before bumping: 1.37.4 dropped
+two legacy routes that older `bw` builds still call, so a broker whose baked-in
+CLI is older than the vault it talks to starts failing at login, not at the
+call site.
+
 ## 5. Issue a client token
 
 Each agent machine gets its own client identity:
