@@ -82,10 +82,20 @@ async function main(): Promise<void> {
     vault,
     grants,
     approver,
+    placement: config.vault_placement,
     approvalTimeoutMs: config.approval_timeout_s * 1000,
     entryTtlMs: config.entry_ttl_s * 1000,
     log,
   });
+  // Whether new Items are owned by an Organization is invisible in the vault UI
+  // until the Owner looks for one and cannot find it, so say it out loud.
+  log(
+    config.vault_placement
+      ? `write: new items go to organization ${config.vault_placement.organization_id} ` +
+          `collection ${config.vault_placement.collection_id}`
+      : "write: VAULT_ORG_ID/VAULT_COLLECTION_ID unset — new items land in the vault " +
+          "account's PERSONAL space, invisible to every other account",
+  );
 
   startHttpServer({
     clients,

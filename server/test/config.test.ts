@@ -64,6 +64,25 @@ describe("loadConfig", () => {
     expect(config.dev_auto_approve).toBe(false);
   });
 
+  test("vault placement is both ids or none: half a placement cannot be applied", () => {
+    // Neither set is a legitimate single-account deployment, not an error.
+    expect(loadConfig(BASE_ENV).vault_placement).toBeNull();
+    expect(loadConfig({ ...BASE_ENV, VAULT_ORG_ID: "", VAULT_COLLECTION_ID: " " }).vault_placement)
+      .toBeNull();
+
+    const org = "deda80ce-2610-4efc-9ed3-3d5044ab01a6";
+    const collection = "ae29d923-31af-41b3-ab2b-77025f626aca";
+    expect(loadConfig({ ...BASE_ENV, VAULT_ORG_ID: org, VAULT_COLLECTION_ID: collection }).vault_placement)
+      .toEqual({ organization_id: org, collection_id: collection });
+
+    // One without the other would have to guess, and guessing wrong files new
+    // Items where nobody looks.
+    expect(() => loadConfig({ ...BASE_ENV, VAULT_ORG_ID: org })).toThrow("together");
+    expect(() => loadConfig({ ...BASE_ENV, VAULT_COLLECTION_ID: collection })).toThrow("together");
+    expect(() => loadConfig({ ...BASE_ENV, VAULT_ORG_ID: "not-a-uuid", VAULT_COLLECTION_ID: collection }))
+      .toThrow("VAULT_ORG_ID");
+  });
+
   test("ENTRY_TTL_S is bounded: a long-lived entry link is a long-lived capability", () => {
     expect(loadConfig({ ...BASE_ENV, ENTRY_TTL_S: "120" }).entry_ttl_s).toBe(120);
     expect(() => loadConfig({ ...BASE_ENV, ENTRY_TTL_S: "1" })).toThrow("ENTRY_TTL_S");

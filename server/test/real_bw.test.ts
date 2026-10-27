@@ -12,6 +12,7 @@ import { cloneItem, dropItemField, newLoginItemPayload, setItemField } from "../
 import {
   bwSubprocessPath,
   createLoginItemWithBw,
+  createOrganizationWithCollection,
   fetchWithCa,
   obtainUserApiKey,
   registerVaultwardenAccount,
@@ -21,12 +22,16 @@ import {
 const enabled = process.env.INTEGRATION_REAL_BW === "1";
 
 const BW_PATH = "/usr/local/bin/bw";
+/** The account the Broker's `bw` runs as, which is also the Organization's
+ * member that writes — the real topology, and the one a personal Item escapes. */
 const EMAIL = "secretary-test@example.com";
+
 // Test-only fixed credential values; never real secrets.
 const MASTER_PASSWORD = "secretary-it-master-9f2c";
 const ITEM_NAME = "Secretary Test Item";
 const ITEM_PASSWORD = "s3cret-value-xyz";
 const ITEM_USERNAME = "svc-user";
+const PLACED_ITEM_NAME = "Secretary Placed Item";
 const WRITE_ITEM_NAME = "Secretary Write Item";
 const WRITE_ITEM_DESCRIPTION = "created by the secretary write-path integration test";
 
@@ -44,11 +49,25 @@ test.skipIf(!enabled)("real vaultwarden + real bw CLI end to end", async () => {
   // The container serves a self-signed cert (bw refuses plain http).
   const fetchImpl = fetchWithCa(container.caFile);
 
-  await registerVaultwardenAccount(container.url, EMAIL, MASTER_PASSWORD, { fetchImpl });
+  const registered = await registerVaultwardenAccount(container.url, EMAIL, MASTER_PASSWORD, { fetchImpl });
   const apiKey = await obtainUserApiKey(container.url, EMAIL, MASTER_PASSWORD, { fetchImpl });
   expect(apiKey.client_id.startsWith("user.")).toBe(true);
   expect(apiKey.client_secret.length).toBeGreaterThan(0);
-
+  // The Organization is created by the same account the Broker's `bw` runs as,
+  // which is the real topology: the automation account is the org member that
+  // writes, and the Owner reaches the result through their own membership of
+  // that org — which is precisely what a personally filed Item never gets.
+  const placement = await createOrganizationWithCollection({
+    baseUrl: container.url,
+    accessToken: apiKey.access_token,
+    userKey: registered.userKey,
+    userPublicKey: registered.publicKey,
+    name: "Secretary Test Org",
+    collectionName: "fnox",
+    fetchImpl,
+  });
+  expect(placement.organization_id.length).toBeGreaterThan(0);
+  expect(placement.collection_id.length).toBeGreaterThan(0);
   const seedAppData = await mkdtemp(join(tmpdir(), "secretary-bw-seed-"));
   cleanups.push(() => rm(seedAppData, { recursive: true, force: true }));
   await createLoginItemWithBw({
@@ -150,4 +169,49 @@ test.skipIf(!enabled)("real vaultwarden + real bw CLI end to end", async () => {
   // Soft delete: gone from the vault, recoverable from its trash.
   await vault.trashItem(afterDrop.item_id);
   expect(await vault.findItemsByName(WRITE_ITEM_NAME)).toHaveLength(0);
+
+  // -- vault placement, against a real Organization -------------------------
+  // The bug this guards: `bw` files a created Item in the personal space by
+  // default, and a personal Item is invisible to every other account — not
+  // merely unshared, but absent from their vault. Only a real vault (with a
+  // real Collection key) can prove the item lands owned by the Organization
+  // and readable by the Broker afterwards.
+  const placed = await vault.createItem(newLoginItemPayload(
+    PLACED_ITEM_NAME,
+    "created inside an organization collection by the secretary write path",
+    new Map([["password", "placed-secret"]]),
+    undefined,
+    placement,
+  )) as unknown;
+  expect(placed).toBeUndefined();
+
+  const [placedItem] = await vault.findItemsByName(PLACED_ITEM_NAME);
+  expect(placedItem).toBeDefined();
+  expect(placedItem.raw.organizationId).toBe(placement.organization_id);
+  expect(placedItem.raw.collectionIds).toEqual([placement.collection_id]);
+  // Ownership is not enough: the item must still be decryptable by the Broker,
+  // which is the half that fails if the Collection key never made it into the
+  // write.
+  const placedValues = await vault.readValues([
+    { item_id: placedItem.item_id, field: "password" },
+  ]);
+  expect(placedValues.get(valueKey(placedItem.item_id, "password"))).toBe("placed-secret");
+
+  // Finally the assertion the reported bug would fail, read back through the
+  // Broker's own sync: the Item is owned by the Organization and lives in the
+  // Collection. A personally filed Item carries neither, which is exactly why
+  // it never appears under an Organization for any account.
+  const syncResponse = await fetchImpl(`${container.url}/api/sync`, {
+    headers: { Authorization: `Bearer ${apiKey.access_token}` },
+  });
+  expect(syncResponse.ok).toBe(true);
+  const synced = (await syncResponse.json()) as {
+    ciphers?: Array<{ id?: string; organizationId?: string; collectionIds?: string[] }>;
+    profile?: { organizations?: Array<{ id?: string }> };
+  };
+  expect(synced.profile?.organizations?.map((org) => org.id)).toContain(placement.organization_id);
+  const syncedItem = synced.ciphers?.find((cipher) => cipher.id === placedItem.item_id);
+  expect(syncedItem).toBeDefined();
+  expect(syncedItem?.organizationId).toBe(placement.organization_id);
+  expect(syncedItem?.collectionIds).toEqual([placement.collection_id]);
 }, 300_000);

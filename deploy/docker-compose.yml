@@ -29,6 +29,12 @@ services:
       # Extra CA bundle for a self-signed/internal vaultwarden cert (optional).
       # NODE_EXTRA_CA_CERTS: /vw-tls/cert.pem
       BW_EMAIL: ${BW_EMAIL}
+      # Where newly created Items are filed. Unset (both) means the vault
+      # account's personal space: only that account can see them, which is
+      # fine for a single-account vault and a trap for any other. Set both to
+      # give the Owner's own account visibility of what agents store.
+      VAULT_ORG_ID: ${VAULT_ORG_ID:-}
+      VAULT_COLLECTION_ID: ${VAULT_COLLECTION_ID:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
       TELEGRAM_ALLOWED_USER_IDS: ${TELEGRAM_ALLOWED_USER_IDS}
       # Optional tuning; empty means the broker defaults (300 / 60 / 600).

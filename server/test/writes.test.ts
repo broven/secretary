@@ -20,10 +20,14 @@ import {
 import type { AuthedClient } from "../src/requests.ts";
 import type { BwItem, SecretField, Vault, VaultItemSnapshot } from "../src/vault.ts";
 import { howToGetOf, itemFieldValue, safeFields, snapshotItemsNamed } from "../src/vault.ts";
-import { makeFingerprinter, newLoginItemPayload, parseWriteBody, WriteBroker, WriteError } from "../src/writes.ts";
+import { makeFingerprinter, newLoginItemPayload, parseWriteBody, WriteBroker, WriteError, type ItemPlacement } from "../src/writes.ts";
 
 const CLIENT: AuthedClient = { client_id: "11111111-2222-3333-4444-555555555555", name: "laptop" };
 const ITEM_ID = "aaaaaaaa-bbbb-cccc-dddd-000000000001";
+const PLACEMENT: ItemPlacement = {
+  organization_id: "deda80ce-2610-4efc-9ed3-3d5044ab01a6",
+  collection_id: "ae29d923-31af-41b3-ab2b-77025f626aca",
+};
 
 function uuid(n: number): string {
   return `${String(n).padStart(8, "0")}-1111-4222-8333-444444444444`;
@@ -106,7 +110,7 @@ afterEach(() => {
   while (dbs.length) dbs.pop()!.close();
 });
 
-function makeBroker(items: BwItem[] = []) {
+function makeBroker(items: BwItem[] = [], placement: ItemPlacement | null = null) {
   const db = new Database(":memory:");
   dbs.push(db);
   const grants = new GrantStore(db);
@@ -116,6 +120,7 @@ function makeBroker(items: BwItem[] = []) {
     vault,
     grants,
     approver,
+    placement,
     approvalTimeoutMs: 1_000,
     entryTtlMs: 10_000,
   });
@@ -230,6 +235,62 @@ describe("create", () => {
     const rendered = JSON.stringify(card);
     expect(rendered).not.toContain("k-123");
     expect(card.lines.find((line) => line.label === "字段 api_key")?.value).toMatch(/^[0-9a-f]{8}$/);
+  });
+
+  test("a created item is filed into the configured organization collection", async () => {
+    // Without this the vault files the item personally, where only the broker's
+    // own vault account can see it — not the Owner's account, however
+    // privileged that account is inside the organization.
+    const { broker, vault } = makeBroker([], PLACEMENT);
+    const result = await broker.handle(
+      body({
+        operation: "create",
+        item: "Acme Prod",
+        description: "Acme 生产部署账号",
+        fields: [{ name: "password", source: "inline" }],
+        values: { password: "s3cret" },
+      }),
+      CLIENT,
+    );
+    expect(result.status).toBe("applied");
+    const created = vault.items[0] as Record<string, unknown>;
+    expect(created.organizationId).toBe(PLACEMENT.organization_id);
+    expect(created.collectionIds).toEqual([PLACEMENT.collection_id]);
+  });
+
+  test("without a placement the item stays personal: a one-account vault has nowhere else to put it", async () => {
+    const { broker, vault } = makeBroker();
+    await broker.handle(
+      body({
+        operation: "create",
+        item: "Acme Prod",
+        description: "Acme 生产部署账号",
+        fields: [{ name: "password", source: "inline" }],
+        values: { password: "s3cret" },
+      }),
+      CLIENT,
+    );
+    const created = vault.items[0] as Record<string, unknown>;
+    expect(created.organizationId).toBeNull();
+    expect(created.collectionIds).toEqual([]);
+  });
+
+  test("a field is not added to an item left behind in the personal space", async () => {
+    // Applying it would leave that item invisible for good while the Owner
+    // believes the vault holds it. Refusing makes the move a precondition.
+    const { broker, vault } = makeBroker([loginItem({ organizationId: null })], PLACEMENT);
+    await expect(
+      broker.handle(
+        body({
+          operation: "create",
+          item: "Acme Prod",
+          fields: [{ name: "api_key", source: "inline" }],
+          values: { api_key: "k-123" },
+        }),
+        CLIENT,
+      ),
+    ).rejects.toThrow("个人空间");
+    expect(vault.items[0]!.fields ?? []).toEqual([]);
   });
 
   test("a taken name is an error, not a silent success", async () => {

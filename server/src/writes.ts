@@ -281,6 +281,13 @@ export function parseWriteBody(value: unknown): ParsedWrite {
 // Item payload construction
 // ---------------------------------------------------------------------------
 
+/**
+ * Where a newly created Item lands. Without one, `bw` files it in the vault
+ * account's personal space, where a human logging in with their own account
+ * can never see it (CONTEXT.md "Vault placement").
+ */
+export type ItemPlacement = { organization_id: string; collection_id: string };
+
 /** Shape of `bw get template item`, so a created Item looks exactly like one
  * the official clients would make. */
 export function newLoginItemPayload(
@@ -288,10 +295,11 @@ export function newLoginItemPayload(
   description: string,
   values: Map<SecretField, string>,
   howToGet?: string,
+  placement?: ItemPlacement | null,
 ): Record<string, unknown> {
   const item: Record<string, unknown> = {
-    organizationId: null,
-    collectionIds: null,
+    organizationId: placement?.organization_id ?? null,
+    collectionIds: placement ? [placement.collection_id] : [],
     folderId: null,
     type: 1,
     name,
@@ -389,6 +397,8 @@ export type WriteBrokerDeps = {
   vault: Vault;
   grants: GrantStore;
   approver: Approver;
+  /** Organization/Collection for new Items; null = the account's personal space. */
+  placement?: ItemPlacement | null;
   approvalTimeoutMs: number;
   entryTtlMs: number;
   now?: () => number;
@@ -552,14 +562,37 @@ export class WriteBroker {
   ): Promise<void> {
     if (!existing) {
       await this.deps.vault.createItem(
-        newLoginItemPayload(parsed.item, parsed.description ?? "", values, parsed.how_to_get),
+        newLoginItemPayload(
+          parsed.item,
+          parsed.description ?? "",
+          values,
+          parsed.how_to_get,
+          this.deps.placement ?? null,
+        ),
       );
       return;
     }
+    this.assertPlaced(parsed.item, existing);
     const draft = cloneItem(existing.raw);
     for (const [field, value] of values) setItemField(draft, field, value);
     if (parsed.how_to_get) setItemNoteField(draft, HOW_TO_GET_FIELD, parsed.how_to_get);
     await this.deps.vault.replaceItem(existing.item_id, draft);
+  }
+
+  /**
+   * Adding a Field to an Item left behind in the personal space would keep that
+   * Item invisible to the Owner's own account forever. Say so instead of
+   * silently extending the problem.
+   */
+  private assertPlaced(itemName: string, existing: VaultItemSnapshot): void {
+    const placement = this.deps.placement;
+    if (!placement) return;
+    if (existing.raw.organizationId === placement.organization_id) return;
+    throw new WriteError(
+      `条目 "${itemName}" 还在 broker 账号的个人空间里（不在组织 collection 中），` +
+        `先把它移进组织再用它。`,
+      409,
+    );
   }
 
   private mintEntry(
@@ -671,6 +704,7 @@ export class WriteBroker {
     client: AuthedClient,
     existing: VaultItemSnapshot,
   ): Promise<WriteResult> {
+    this.assertPlaced(parsed.item, existing);
     const target = parsed.rename!;
     if (existing.name === target) {
       return { status: "unchanged", operation: "update", item: parsed.item, detail: "条目名已经是目标值" };

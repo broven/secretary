@@ -7,6 +7,13 @@ import { readFileSync } from "node:fs";
 
 export type BrokerConfig = {
   vault_url: string;
+  /**
+   * Where newly created Items are placed (CONTEXT.md "Vault placement").
+   * null means the vault account's personal space, which is invisible to
+   * every other account — that is a legitimate choice for a single-account
+   * deployment and the reason the pair is optional.
+   */
+  vault_placement: { organization_id: string; collection_id: string } | null;
   bw_clientid: string;
   bw_clientsecret: string;
   bw_email: string;
@@ -110,6 +117,29 @@ function parseBoundedInt(value: string, name: string, fallback: number, min: num
   return parsed;
 }
 
+const VAULT_ID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+/**
+ * Resolve the Organization / Collection every new Item goes into.
+ *
+ * Both or neither: a placement missing one half cannot be applied, and
+ * silently falling back to the personal space would recreate exactly the bug
+ * this exists to prevent — Items that only the automation account can see.
+ */
+export function parseVaultPlacement(
+  env: Env,
+): { organization_id: string; collection_id: string } | null {
+  const organizationId = (env.VAULT_ORG_ID ?? "").trim();
+  const collectionId = (env.VAULT_COLLECTION_ID ?? "").trim();
+  if (!organizationId && !collectionId) return null;
+  if (!organizationId || !collectionId) {
+    throw new Error("VAULT_ORG_ID and VAULT_COLLECTION_ID must be set together (or neither)");
+  }
+  if (!VAULT_ID.test(organizationId)) throw new Error(`VAULT_ORG_ID invalid: ${organizationId}`);
+  if (!VAULT_ID.test(collectionId)) throw new Error(`VAULT_COLLECTION_ID invalid: ${collectionId}`);
+  return { organization_id: organizationId, collection_id: collectionId };
+}
+
 export function parseVaultUrl(value: string): string {
   const raw = requireValue(value, "VAULT_URL").replace(/\/+$/, "");
   let url: URL;
@@ -139,6 +169,7 @@ export function loadConfig(env: Env = process.env): BrokerConfig {
   }
   return {
     vault_url: parseVaultUrl(env.VAULT_URL ?? ""),
+    vault_placement: parseVaultPlacement(env),
     bw_clientid: requireValue(readSecretEnv(env, "BW_CLIENTID"), "BW_CLIENTID"),
     bw_clientsecret: requireValue(readSecretEnv(env, "BW_CLIENTSECRET"), "BW_CLIENTSECRET"),
     bw_email: requireValue((env.BW_EMAIL ?? "").trim(), "BW_EMAIL"),

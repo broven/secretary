@@ -144,6 +144,30 @@ By hand:
    - CI or other automated runs: export `SECRETARY_URL`, `SECRETARY_TOKEN` and
      optional `SECRETARY_CLIENT_ID`; environment variables override platform storage.
 
+### Item ownership (who can see what the broker writes)
+
+Every Item the broker creates is filed by `bw` in the **vault account's personal
+space** unless the deployment says otherwise, and a personal Item is visible to
+that account only — not to an organization the account belongs to, however
+privileged. If the Owner logs into the vault with their own account while the
+broker runs as a dedicated automation account, everything the agents stored is
+invisible to them.
+
+Set both ids to file new Items into an organization collection instead:
+
+```sh
+# vault web UI → that collection → the URL contains both ids
+VAULT_ORG_ID=<organization uuid>
+VAULT_COLLECTION_ID=<collection uuid>
+```
+
+The automation account needs **write** access to that collection (Vaultwarden
+collection permissions: not read-only); collection management is not required.
+With the pair set, the broker also refuses to add Fields to Items that are
+still personal rather than quietly extending the problem — move those first
+(`bw move <item-id> <org-id> <encoded collection ids>` from the automation
+account, or drag them in the web UI).
+
 ## 7. Smoke test
 
 ```sh
