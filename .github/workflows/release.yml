@@ -41,7 +41,11 @@ jobs:
             echo "::group::$target"
             stage="dist/stage-$target"
             mkdir -p "$stage"
-            SECRETARY_TARGET="bun-$target" \
+            # linux-x64 ships Bun's baseline build: the default x64 target needs
+            # AVX2 and dies with SIGILL on CPUs without it (e.g. Intel J4125).
+            bun_target="bun-$target"
+            [ "$target" = linux-x64 ] && bun_target="bun-linux-x64-baseline"
+            SECRETARY_TARGET="$bun_target" \
             SECRETARY_OUTFILE="$PWD/$stage/secretary-core" \
               sh cli/build.sh
             # The wrapper travels with the binary; the installer rewrites its
